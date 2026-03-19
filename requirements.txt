@@ -1,0 +1,10 @@
+pydantic
+pandas
+pytest
+dotenv
+supabase
+fyers-apiv3
+playwright
+pytz
+fyers_apiv3
+google-genai
