@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.parser import SignalParser
-from data.repository import SupabaseRepository
+from core.repository import SupabaseRepository
 
 load_dotenv()
 
@@ -27,7 +27,7 @@ def run():
     
     with TelegramClient('kattalan_session', int(API_ID), API_HASH) as client:
         target_entity = None
-        for dialog in client.get_dialogs(limit=50):
+        for dialog in client.get_dialogs(limit=150):
             if dialog.name == TARGET_CHAT_NAME:
                 target_entity = dialog.entity
                 break
@@ -46,19 +46,17 @@ def run():
                 print(f"\n⚙️ Analyzing Message ID: {msg.id}...")
                 
                 try:
-                    # Pass the raw Telegram text to your Gemini AI
                     result = parser.parse(msg.text, msg.date, "Trade_With_Logic", str(msg.id))
                     signal = result['signal']
+                    instr = result['instrument_data'] 
                     
-                    # Gemini will throw an error if it's spam (missing strike, entry, etc.)
-                    # If it succeeds, we save it to Supabase!
-                    repo.save_signal(signal)
-                    print(f"✅ SAVED TO DATABASE: {signal.underlying} {signal.strike} {signal.instrument_type}")
+                    repo.upsert_signal(signal)
+                    
+                    print(f"✅ SAVED TO DATABASE: {instr.underlying} {instr.strike} {instr.instrument_type}")
                     saved_count += 1
                     
                 except ValueError as e:
-                    # This catches the spam that slipped past our bouncer
-                    print(f"⚠️ Ignored by AI: Not a valid trade format.")
+                    print(f"⚠️ Ignored by AI: {e}")
                 except Exception as e:
                     print(f"❌ DB Error: {e}")
                     
