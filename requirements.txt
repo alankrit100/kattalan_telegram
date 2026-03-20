@@ -8,3 +8,4 @@ playwright
 pytz
 fyers_apiv3
 google-genai
+fastapi

@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from datetime import datetime
 import logging
 import os
+from core.utils import is_potential_signal
 
 from core.orchestrator import KattalanOrchestrator
 from data.provider_csv import CSVMarketDataProvider
@@ -27,46 +28,57 @@ else:
     orchestrator = None
 
 @app.post("/webhook/telegram")
-async def telegram_webhook(payload: dict): # <-- Changed this line to expect a JSON dictionary
-    """
-    The endpoint Telegram hits when a channel posts a message.
-    """
+async def telegram_webhook(payload: dict):
     if not orchestrator:
-        raise HTTPException(status_code=500, detail="Engine offline. Data provider missing.")
+        raise HTTPException(status_code=500, detail="Engine offline.")
 
     try:
-        # Since we used `payload: dict`, FastAPI automatically parses the JSON for us!
-        
-        # Extract message block (channels use 'channel_post', groups/bots use 'message')
-        message_block = payload.get("message") or payload.get("channel_post")
-        
+        message_block = (
+            payload.get("message") or
+            payload.get("channel_post") or
+            payload.get("edited_message") or
+            payload.get("edited_channel_post")
+        )
+
         if not message_block or "text" not in message_block:
             return {"status": "ignored", "reason": "Not a text message"}
 
         raw_text = message_block["text"]
-        
-        # Telegram sends time as a UNIX timestamp
+
+        if not is_potential_signal(raw_text):
+            return {"status": "ignored", "reason": "Not a trading signal"}
+
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+
         unix_time = message_block["date"]
-        message_time = datetime.fromtimestamp(unix_time)
+        message_time = datetime.fromtimestamp(unix_time, tz=ist)
 
-        logger.info(f"Incoming Signal at {message_time}: {raw_text[:30]}...")
+        message_id = str(message_block.get("message_id"))
+        channel_id = str(message_block.get("chat", {}).get("id"))
 
-        # Run the Kattalan Pipeline
+        is_edited = "edit_date" in message_block
+
+        logger.info(f"[{channel_id}] {message_time} | {raw_text[:30]}...")
+
         result = orchestrator.process_live_message(
             raw_text=raw_text,
             message_time=message_time,
-            symbol="BANKNIFTY"
+            symbol="BANKNIFTY",
+            channel_id=channel_id,
+            message_id=message_id
         )
-        
-        logger.info(f"Signal Processed: {result.status} | Exit: {result.exit_executed_price}")
-        
-        return {"status": "success", "evaluation": result.model_dump()}
+
+        return {
+            "status": "success",
+            "edited": is_edited,
+            "evaluation": result.model_dump()
+        }
 
     except Exception as e:
-        logger.error(f"Processing Error: {str(e)}")
+        logger.exception("Processing Error")
         return {"status": "error", "message": str(e)}
-
-
+    
 @app.get("/health")
 def health_check():
     """Verify the server is running."""
