@@ -7,6 +7,9 @@ class Signal(BaseModel):
     channel_id: str  # NEW: For idempotency
     message_id: str  # NEW: For idempotency
     raw_text: str
+    underlying: str
+    instrument_type: str
+    strike: Optional[float] = None
     direction: Literal["BUY", "SELL"]
     entry_price: float
     targets: List[float] 

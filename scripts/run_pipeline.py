@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from telethon.sync import TelegramClient
 from dotenv import load_dotenv
 
@@ -7,21 +8,21 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.parser import SignalParser
 from core.repository import SupabaseRepository
+from core.utils import is_potential_signal
 
 load_dotenv()
 
 API_ID = os.environ.get("TG_API_ID")
 API_HASH = os.environ.get("TG_API_HASH")
 TARGET_CHAT_NAME = "Trade With Logic (Index + Stock)" 
-SIGNAL_KEYWORDS = ['BUY', 'SELL', 'SL', 'TGT', 'TARGET', 'CE', 'PE', 'CALL', 'PUT', 'ABOVE', 'BELOW']
+BATCH_SIZE = 30
 
-def is_potential_signal(text: str) -> bool:
-    text_upper = text.upper()
-    return any(keyword in text_upper for keyword in SIGNAL_KEYWORDS)
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 def run():
-    print("🚀 BOOTING KATTALAN INGESTION PIPELINE...\n")
-    
+    print("🚀 BOOTING BATCH INGESTION PIPELINE...\n")
     parser = SignalParser()
     repo = SupabaseRepository()
     
@@ -36,33 +37,43 @@ def run():
             print("❌ Could not find channel.")
             return
 
-        print(f"📥 Fetching last 30 messages from '{TARGET_CHAT_NAME}'...")
-        messages = client.get_messages(target_entity, limit=30)
+        print(f"📥 Fetching last 1000 messages from '{TARGET_CHAT_NAME}'...")
+        messages = client.get_messages(target_entity, limit=1000)
         
-        saved_count = 0
-        
+        # Filter spam locally first
+        filtered_messages = []
         for msg in messages:
             if msg.text and is_potential_signal(msg.text):
-                print(f"\n⚙️ Analyzing Message ID: {msg.id}...")
+                filtered_messages.append({"message_id": str(msg.id), "text": msg.text, "time": msg.date})
+
+        print(f"📦 Sending {len(filtered_messages)} potential signals to AI in batches of {BATCH_SIZE}...\n")
+        saved_count = 0
+        batches = list(chunk_list(filtered_messages, BATCH_SIZE))
+        
+        for index, batch in enumerate(batches):
+            print(f"⚙️ Processing Batch {index + 1}/{len(batches)}...")
+            
+            try:
+                parsed_results = parser.parse_batch(batch_data=batch, channel_id="Trade_With_Logic")
                 
-                try:
-                    result = parser.parse(msg.text, msg.date, "Trade_With_Logic", str(msg.id))
+                for result in parsed_results:
                     signal = result['signal']
-                    instr = result['instrument_data'] 
-                    
-                    repo.upsert_signal(signal)
-                    
-                    print(f"✅ SAVED TO DATABASE: {instr.underlying} {instr.strike} {instr.instrument_type}")
-                    saved_count += 1
-                    
-                except ValueError as e:
-                    print(f"⚠️ Ignored by AI: {e}")
-                except Exception as e:
-                    print(f"❌ DB Error: {e}")
-                    
-        print("\n=================================================")
-        print(f"🎉 PIPELINE COMPLETE! Saved {saved_count} new trades to Supabase.")
-        print("=================================================")
+                    instr = result['instrument_data']
+                    try:
+                        repo.upsert_signal(signal)
+                        print(f"  ✅ SAVED TO DATABASE: {instr.underlying} {instr.strike} {instr.instrument_type}")
+                        saved_count += 1
+                    except Exception as e:
+                        print(f"  ❌ DB Error: {e}")
+
+            except Exception as e:
+                print(f"❌ Batch Error: {e}")
+            
+            if index < len(batches) - 1:
+                print("⏳ Sleeping 12 seconds for rate limits...")
+                time.sleep(12)
+                
+        print(f"\n🎉 COMPLETE! Saved {saved_count} historical trades.")
 
 if __name__ == "__main__":
     run()
