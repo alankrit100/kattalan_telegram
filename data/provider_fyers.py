@@ -8,7 +8,7 @@ from core.schemas import OHLC
 from data.provider_base import MarketDataProvider
 
 # Load the .env file
-load_dotenv()
+load_dotenv(override=True)
 
 class FyersDataProvider(MarketDataProvider):
     """
@@ -18,6 +18,8 @@ class FyersDataProvider(MarketDataProvider):
         self.ist = pytz.timezone('Asia/Kolkata')
         self.client_id = os.environ.get("FYERS_CLIENT_ID")
         self.access_token = os.environ.get("FYERS_ACCESS_TOKEN")
+        #debug
+        print(f"DEBUG: Fyers Client ID: {self.client_id}| Token starts with: {str(self.access_token)[:10]}...")
         
         if not self.client_id or not self.access_token:
             raise ValueError("FATAL: Missing Fyers credentials in .env file.")
