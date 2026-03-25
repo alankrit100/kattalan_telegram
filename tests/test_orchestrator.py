@@ -15,7 +15,7 @@ def mock_csv_path():
             "2023-01-01 10:02:00",
             "2023-01-01 10:03:00" 
         ],
-        "symbol": ["BANKNIFTY", "BANKNIFTY", "BANKNIFTY", "BANKNIFTY"],
+        "symbol": ["NSE:NIFTYBANK-INDEX", "NSE:NIFTYBANK-INDEX", "NSE:NIFTYBANK-INDEX", "NSE:NIFTYBANK-INDEX"],
         "open": [48000.0, 48010.0, 48050.0, 48100.0],
         "high": [48020.0, 48060.0, 48110.0, 48210.0], 
         "low": [47990.0, 48000.0, 48040.0, 48090.0],
@@ -37,7 +37,6 @@ def test_full_pipeline_success(mock_csv_path):
     result = orchestrator.process_live_message(
         raw_text=raw_telegram_message, 
         message_time=message_time, 
-        symbol="BANKNIFTY",
         channel_id="TEST_CH",
         message_id="TEST_MSG"
     )

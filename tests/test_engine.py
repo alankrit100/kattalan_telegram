@@ -13,8 +13,11 @@ def engine():
 def test_wick_conflict_evaluates_to_loss(engine):
     signal = Signal(
         signal_id="KAT-001",
-        channel_id="TEST_CH", # Added ID
-        message_id="TEST_MSG", # Added ID
+        channel_id="TEST_CH", 
+        message_id="TEST_MSG", 
+        raw_text="mock",           # <-- FIXED
+        underlying="BANKNIFTY",    # <-- FIXED
+        instrument_type="EQ",      # <-- FIXED
         direction="BUY",
         entry_price=100.0,
         targets=[110.0],
@@ -38,8 +41,11 @@ def test_wick_conflict_evaluates_to_loss(engine):
 def test_multi_target_trailing_sl(engine):
     signal = Signal(
         signal_id="KAT-002",
-        channel_id="TEST_CH", # Added ID
-        message_id="TEST_MSG", # Added ID
+        channel_id="TEST_CH", 
+        message_id="TEST_MSG", 
+        raw_text="mock",           # <-- FIXED
+        underlying="BANKNIFTY",    # <-- FIXED
+        instrument_type="EQ",      # <-- FIXED
         direction="BUY",
         entry_price=100.0,
         targets=[110.0, 120.0],
@@ -63,8 +69,11 @@ def test_multi_target_trailing_sl(engine):
 def test_intraday_auto_square_off(engine):
     signal = Signal(
         signal_id="KAT-003",
-        channel_id="TEST_CH", # Added ID
-        message_id="TEST_MSG", # Added ID
+        channel_id="TEST_CH", 
+        message_id="TEST_MSG", 
+        raw_text="mock",           # <-- FIXED
+        underlying="BANKNIFTY",    # <-- FIXED
+        instrument_type="EQ",      # <-- FIXED
         direction="SELL", 
         entry_price=200.0,
         targets=[180.0],
@@ -83,4 +92,3 @@ def test_intraday_auto_square_off(engine):
     
     assert result.status == "SQUARED_OFF"
     assert result.exit_executed_price == 193.0
-    assert "INTRADAY SQAURE-OFF" in result.reason

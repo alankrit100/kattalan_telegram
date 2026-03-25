@@ -5,7 +5,7 @@ import os
 from core.utils import is_potential_signal
 
 from core.orchestrator import KattalanOrchestrator
-from data.provider_csv import CSVMarketDataProvider
+from data.provider_fyers import FyersDataProvider
 
 # Set up logging for terminal visibility
 logging.basicConfig(level=logging.INFO)
@@ -14,18 +14,14 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Kattalan Live Engine")
 
 # 1. Initialize the Engine on Startup
-csv_path = "data/live_data.csv"
-if os.path.exists(csv_path):
-    try:
-        provider = CSVMarketDataProvider(csv_path)
+try:
+        provider = FyersDataProvider()
         orchestrator = KattalanOrchestrator(provider)
         logger.info("Kattalan Engine Successfully Initialized.")
-    except Exception as e:
+except Exception as e:
         logger.error(f"FATAL: Could not initialize orchestrator. {str(e)}")
         orchestrator = None
-else:
-    logger.warning(f"WARNING: {csv_path} not found. Engine is offline. Drop a CSV to enable.")
-    orchestrator = None
+
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(payload: dict):
@@ -64,7 +60,6 @@ async def telegram_webhook(payload: dict):
         result = orchestrator.process_live_message(
             raw_text=raw_text,
             message_time=message_time,
-            symbol="BANKNIFTY",
             channel_id=channel_id,
             message_id=message_id
         )

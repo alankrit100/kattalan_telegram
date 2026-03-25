@@ -52,12 +52,27 @@ class SignalParser:
                 ),
             )
             extracted = ExtractedSignal.model_validate_json(response.text)
+            
+            # --- THE FIX: Fully populated Signal object ---
             signal = Signal(
-                signal_id=str(uuid.uuid4()), channel_id=channel_id, message_id=message_id,
-                raw_text=raw_text, direction=extracted.direction, entry_price=extracted.entry_price,
-                stop_loss=extracted.stop_loss, targets=extracted.targets, is_intraday=True, issued_at=message_time
+                signal_id=str(uuid.uuid4()), 
+                channel_id=channel_id, 
+                message_id=message_id,
+                raw_text=raw_text, 
+                underlying=extracted.underlying,             # NEW
+                instrument_type=extracted.instrument_type,   # NEW
+                strike=extracted.strike,                     # NEW
+                direction=extracted.direction, 
+                entry_price=extracted.entry_price,
+                stop_loss=extracted.stop_loss, 
+                targets=extracted.targets, 
+                is_intraday=True, 
+                issued_at=message_time
             )
+            
+            # --- THE FIX: Return the dictionary contract ---
             return {"signal": signal, "instrument_data": extracted}
+            
         except Exception as e:
             raise ValueError(f"LLM Parsing failed: {e}")
 
