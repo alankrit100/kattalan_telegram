@@ -8,9 +8,19 @@ from core.repository import SupabaseRepository
 def build_fyers_symbol(underlying: str, instr_type: str) -> str:
     """Converts the Telegram asset name into a valid Fyers ticker."""
     underlying = underlying.upper().strip()
+    
+    # 1. Handle Commodities (MCX)
+    if underlying in ["CRUDEOIL", "NATURALGAS", "GOLD", "SILVER"]:
+        # We route to the continuous MCX spot/index for the math evaluation
+        return f"MCX:{underlying}-INDEX" 
+        
+    # 2. Handle Indices (NSE/BSE)
     if "BANK" in underlying: return "NSE:NIFTYBANK-INDEX"
     if "NIFTY" in underlying: return "NSE:NIFTY50-INDEX"
     if "SENSEX" in underlying: return "BSE:SENSEX-INDEX"
+    if "FINNIFTY" in underlying: return "NSE:FINNIFTY-INDEX"
+    
+    # 3. Handle Equity Stocks
     return f"NSE:{underlying}-EQ"
 
 class KattalanOrchestrator:

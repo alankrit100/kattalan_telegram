@@ -14,7 +14,7 @@ class Signal(BaseModel):
     
     # --- NEW MANDATORY FIELDS ---
     underlying: str
-    instrument_type: str = Field(..., description="Must be EQ, CE, or PE")
+    instrument_type: str = Field(..., description="Must be EQ, CE, Pe, or FUT")
     strike: Optional[float] = None
     # ----------------------------
     

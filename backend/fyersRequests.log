@@ -373,3 +373,4 @@
 {"level":"DEBUG","location":"[get_call:140] fyersModel","message":{"Status Code":401,"API":"/history"},"timestamp":"2026-03-24 16:11:38,487+0530","service":"FyersAPIRequest","taskName":"Task-30"}
 {"level":"DEBUG","location":"[get_call:140] fyersModel","message":{"Status Code":401,"API":"/history"},"timestamp":"2026-03-24 16:11:41,392+0530","service":"FyersAPIRequest","taskName":"Task-34"}
 {"level":"DEBUG","location":"[get_call:140] fyersModel","message":{"Status Code":401,"API":"/history"},"timestamp":"2026-03-24 16:11:43,332+0530","service":"FyersAPIRequest","taskName":"Task-36"}
+{"level":"DEBUG","location":"[get_call:140] fyersModel","message":{"Status Code":401,"API":"/history"},"timestamp":"2026-03-26 10:56:32,796+0530","service":"FyersAPIRequest","taskName":"Task-4"}
