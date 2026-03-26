@@ -1,19 +1,24 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import logging
 import os
-from core.utils import is_potential_signal
-
-from core.orchestrator import KattalanOrchestrator
-from data.provider_fyers import FyersDataProvider
-
-from fastapi import FastAPI, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 import json
 import asyncio
+import pytz
 
+from core.utils import is_potential_signal
+from core.orchestrator import KattalanOrchestrator
+from data.provider_fyers import FyersDataProvider
+from core.scraper import scrape_historical_messages
 
+# Set up logging for terminal visibility
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 1. Initialize the App and CORS exactly ONCE
 app = FastAPI(title="Kattalan Live Engine")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,22 +26,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Set up logging for terminal visibility
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Kattalan Live Engine")
-
-# 1. Initialize the Engine on Startup
+# 2. Initialize the Engine on Startup
 try:
-        provider = FyersDataProvider()
-        orchestrator = KattalanOrchestrator(provider)
-        logger.info("Kattalan Engine Successfully Initialized.")
+    provider = FyersDataProvider()
+    orchestrator = KattalanOrchestrator(provider)
+    logger.info("Kattalan Engine Successfully Initialized.")
 except Exception as e:
-        logger.error(f"FATAL: Could not initialize orchestrator. {str(e)}")
-        orchestrator = None
+    logger.error(f"FATAL: Could not initialize orchestrator. {str(e)}")
+    orchestrator = None
 
-
+# --- WEBHOOK ENDPOINT ---
 @app.post("/webhook/telegram")
 async def telegram_webhook(payload: dict):
     if not orchestrator:
@@ -58,15 +58,12 @@ async def telegram_webhook(payload: dict):
         if not is_potential_signal(raw_text):
             return {"status": "ignored", "reason": "Not a trading signal"}
 
-        import pytz
         ist = pytz.timezone("Asia/Kolkata")
-
         unix_time = message_block["date"]
         message_time = datetime.fromtimestamp(unix_time, tz=ist)
 
         message_id = str(message_block.get("message_id"))
         channel_id = str(message_block.get("chat", {}).get("id"))
-
         is_edited = "edit_date" in message_block
 
         logger.info(f"[{channel_id}] {message_time} | {raw_text[:30]}...")
@@ -87,60 +84,94 @@ async def telegram_webhook(payload: dict):
     except Exception as e:
         logger.exception("Processing Error")
         return {"status": "error", "message": str(e)}
-    
+
+# --- WEBSOCKET ENDPOINT ---
 @app.websocket("/api/ws/audit")
 async def audit_channel_websocket(websocket: WebSocket):
-    """
-    This is the live pipeline for your Admin Dashboard.
-    It streams progress percentages back to the frontend in real-time.
-    """
     await websocket.accept()
+    
+    if not orchestrator:
+        await websocket.send_json({"progress": 0, "status": "ERROR: Engine Offline"})
+        return
+        
     try:
-        # 1. Wait for the frontend to send the search query
         data = await websocket.receive_text()
         request_data = json.loads(data)
         
         channel_name = request_data.get("channel_name")
         timeframe = request_data.get("timeframe", "1_month")
         
-        # 2. Start the Scrape (Simulated progress for now to test the UI connection)
-        await websocket.send_json({"progress": 10, "status": f"Connecting to Telegram for {channel_name}..."})
-        await asyncio.sleep(2) # We will replace this with your actual Telethon script later
+        days_map = {"1_month": 30, "3_months": 90, "6_months": 180}
+        lookback_days = days_map.get(timeframe, 30)
+        start_date = datetime.now() - timedelta(days=lookback_days)
         
-        await websocket.send_json({"progress": 30, "status": "Scraped 850 messages. Firing up Gemini AI..."})
+        await websocket.send_json({"progress": 5, "status": f"Connecting to Telegram for {channel_name}..."})
         
-        # 3. The AI Parsing Loop (Streaming the loading bar)
-        for i in range(1, 6):
-            await asyncio.sleep(1) # Simulating the AI batch processing time
+        # Trigger the real scraper
+        raw_messages = await scrape_historical_messages(channel_name, start_date)
+        total_msgs = len(raw_messages)
+        
+        if total_msgs == 0:
+            await websocket.send_json({"progress": 100, "status": "No messages found."})
+            return
+
+        await websocket.send_json({"progress": 20, "status": f"Scraped {total_msgs} messages. Starting AI evaluation..."})
+        
+        success_count = 0
+        total_edge = 0.0
+        
+        for index, msg in enumerate(raw_messages):
+            try:
+                # Threaded math execution so UI doesn't freeze
+                result = await asyncio.to_thread(
+                    orchestrator.process_live_message,
+                    raw_text=msg["text"],
+                    message_time=msg["time"],
+                    channel_id=channel_name,
+                    message_id=msg["id"]
+                )
+                success_count += 1
+                
+                # Simple Edge aggregation for the UI
+                if result.status == "WIN":
+                    total_edge += 1.5 
+                elif result.status == "LOSS":
+                    total_edge -= 1.0
+                    
+            except Exception as e:
+                pass # Skip spam quietly
+                
+            current_progress = 20 + int((index / total_msgs) * 70)
             await websocket.send_json({
-                "progress": 30 + (i * 10), 
-                "status": f"AI Parsing Batch {i}/5..."
+                "progress": current_progress, 
+                "status": f"Evaluated {index + 1}/{total_msgs} trades..."
             })
+            await asyncio.sleep(0.5) # API rate limit protection
             
-        # 4. The Math Engine
-        await websocket.send_json({"progress": 90, "status": "Fetching Fyers Charts & Running Quant Math..."})
-        await asyncio.sleep(2)
+        await websocket.send_json({"progress": 95, "status": "Finalizing statistics..."})
         
-        # 5. Final Result Delivery
+        final_edge = round(total_edge / success_count, 2) if success_count > 0 else 0
+        color_grade = "green" if final_edge > 0 else "red"
+        
         await websocket.send_json({
             "progress": 100, 
-            "status": "Audit Complete! Saving to Supabase.",
+            "status": "Audit Complete! Saved to Supabase.",
             "results": {
                 "channel": channel_name,
-                "total_trades": 142,
-                "win_rate": "68%",
-                "edge_ratio": 1.85,
-                "color_grade": "green" # Your UI will use this to change colors
+                "total_trades": success_count,
+                "win_rate": "TBD",
+                "edge_ratio": final_edge,
+                "color_grade": color_grade
             }
         })
 
     except WebSocketDisconnect:
-        print("Frontend disconnected from the audit stream.")
+        logger.info("Frontend disconnected.")
     except Exception as e:
-        await websocket.send_json({"progress": 0, "status": f"ERROR: {str(e)}"})
-    
+        await websocket.send_json({"progress": 0, "status": f"FATAL ERROR: {str(e)}"})
+
+# --- HEALTH CHECK ---
 @app.get("/health")
 def health_check():
-    """Verify the server is running."""
-    status = "Online" if orchestrator else "Offline (Missing CSV)"
+    status = "Online" if orchestrator else "Offline"
     return {"status": f"Kattalan is {status}."}

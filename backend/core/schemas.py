@@ -29,8 +29,8 @@ class Signal(BaseModel):
     @field_validator('instrument_type')
     def validate_instrument(cls, v):
         v = v.upper()
-        if v not in ['EQ', 'CE', 'PE']:
-            raise ValueError(f"CRITICAL: Invalid instrument_type '{v}'. Must be EQ, CE, or PE.")
+        if v not in ['EQ', 'CE', 'PE', 'FUT']:
+            raise ValueError(f"CRITICAL: Invalid instrument_type '{v}'. Must be EQ, CE,PE, or FUT.")
         return v
 
 class OHLC(BaseModel):
