@@ -1,26 +1,29 @@
 import os
 import uuid
+import json
 from datetime import datetime
 from typing import List, Literal, Optional, Dict
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
+from groq import Groq # <-- Swapped
 from dotenv import load_dotenv
 from core.schemas import Signal
+from google import genai
+from google.genai import types
+
 
 load_dotenv()
 
 # 1. Single Signal Schema
 class ExtractedSignal(BaseModel):
     underlying: str = Field(description="The base asset, e.g., BANKNIFTY, NIFTY, RELIANCE")
-    instrument_type: Literal["CE", "PE", "EQ"] = Field(description="CE for Call, PE for Put, EQ for Equity/Spot")
+    instrument_type: Literal["CE", "PE", "EQ", "FUT"] = Field(description="CE for Call, PE for Put, EQ for Equity/Spot, FUT for Futures")
     strike: Optional[int] = Field(description="Strike price if options, null if equity", default=None)
     direction: Literal["BUY", "SELL"]
     entry_price: float
     stop_loss: float
     targets: List[float]
 
-# 2. Batch Signal Schema (Maps back to the Telegram message ID)
+# 2. Batch Signal Schema
 class BatchExtractedSignal(ExtractedSignal):
     message_id: str = Field(description="The exact message ID provided in the prompt mapping to this signal")
 
@@ -43,7 +46,7 @@ class SignalParser:
         """
         try:
             response = self.client.models.generate_content(
-                model='gemini-2.5-flash-lite',
+                model='gemini-2.5-flash',
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -53,15 +56,14 @@ class SignalParser:
             )
             extracted = ExtractedSignal.model_validate_json(response.text)
             
-            # --- THE FIX: Fully populated Signal object ---
             signal = Signal(
-                signal_id=str(uuid.uuid4()), 
+                signal_id=f"{channel_id}_{message_id}", # <-- DETERMINISTIC ID FIX
                 channel_id=channel_id, 
                 message_id=message_id,
                 raw_text=raw_text, 
-                underlying=extracted.underlying,             # NEW
-                instrument_type=extracted.instrument_type,   # NEW
-                strike=extracted.strike,                     # NEW
+                underlying=extracted.underlying,
+                instrument_type=extracted.instrument_type,
+                strike=extracted.strike,
                 direction=extracted.direction, 
                 entry_price=extracted.entry_price,
                 stop_loss=extracted.stop_loss, 
@@ -70,7 +72,6 @@ class SignalParser:
                 issued_at=message_time
             )
             
-            # --- THE FIX: Return the dictionary contract ---
             return {"signal": signal, "instrument_data": extracted}
             
         except Exception as e:
@@ -81,16 +82,18 @@ class SignalParser:
         if not batch_data: return []
 
         prompt = """You are a strict quantitative extraction engine. 
-I am giving you a batch of Telegram messages. Most of them are useless spam.
+I am giving you a batch of Telegram messages.
 Find ONLY the messages that contain a CLEAR trading signal.
-A clear signal MUST have:
-1. An instrument (e.g., BANKNIFTY, RELIANCE)
-2. A direction (BUY or SELL)
-3. An entry price
-4. A stop loss (SL)
-5. At least one target (TGT)
+Return a JSON object with a key 'valid_signals' containing the list of extracted data.
 
-For every valid signal you find, extract the data and include the EXACT 'message_id' I provided. If a message is spam, conversational, or missing exact numbers, IGNORE IT completely.
+CRITICAL RULES:
+1. THE "PAID" STOP LOSS RULE: If the Stop Loss is "PAID", hidden, or missing, calculate a mechanical stop loss: 
+   - For BUY signals: 15% below the entry_price (entry_price * 0.85)
+   - For SELL signals: 15% above the entry_price (entry_price * 1.15)
+   Output this calculated number as the stop_loss float.
+2. All price fields MUST be numbers (floats). Absolutely no text.
+3. message_id MUST be a string.
+4. "instrument_type" MUST strictly be "CE", "PE", "EQ", or "FUT". NEVER use the words "CALL" or "PUT".
 
 Here is the batch:
 """
@@ -99,7 +102,7 @@ Here is the batch:
 
         try:
             response = self.client.models.generate_content(
-                model='gemini-2.5-flash-lite',
+                model='gemini-2.5-flash', # Use flash instead of flash-lite for better math reasoning
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -112,26 +115,26 @@ Here is the batch:
             results = []
             
             for extracted in parsed_batch.valid_signals:
-                original_msg = next((msg for msg in batch_data if msg['message_id'] == extracted.message_id), None)
+                original_msg = next((msg for msg in batch_data if str(msg['message_id']) == extracted.message_id), None)
                 if not original_msg: continue
                     
                 signal = Signal(
-                    signal_id=str(uuid.uuid4()), 
+                    signal_id=f"{channel_id}_{extracted.message_id}", # <-- DETERMINISTIC ID FIX
                     channel_id=channel_id, 
-                    message_id=extracted.message_id, # Or message_id for the single parse method
-                    raw_text=original_msg['text'],   # Or raw_text for the single parse method
-                    underlying=extracted.underlying,           # <-- NEW
-                    instrument_type=extracted.instrument_type, # <-- NEW
-                    strike=extracted.strike,                   # <-- NEW
+                    message_id=extracted.message_id, 
+                    raw_text=original_msg['text'],
+                    underlying=extracted.underlying,
+                    instrument_type=extracted.instrument_type,
+                    strike=extracted.strike,
                     direction=extracted.direction, 
                     entry_price=extracted.entry_price,
                     stop_loss=extracted.stop_loss, 
                     targets=extracted.targets, 
                     is_intraday=True, 
-                    issued_at=original_msg['time']   # Or message_time for the single parse method
+                    issued_at=original_msg['time']
                 )
                 results.append({"signal": signal, "instrument_data": extracted})
                 
             return results
         except Exception as e:
-            raise ValueError(f"Batch LLM Parsing failed: {e}")
+            raise ValueError(f"Batch Gemini Parsing failed: {e}")
