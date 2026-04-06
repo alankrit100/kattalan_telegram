@@ -1,55 +1,89 @@
 import os
-from datetime import datetime, timezone
+import asyncio
+import logging
+from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError, ChannelPrivateError
 
-API_ID = int(os.environ.get("TG_API_ID"))
-API_HASH = os.environ.get("TG_API_HASH")
+log = logging.getLogger(__name__)
 
-async def scrape_historical_messages(channel_name: str, start_date: datetime):
-    """Connects to Telegram, finds the channel, and pulls messages since start_date."""
-    
-    client = TelegramClient('historical_session', API_ID, API_HASH)
-    await client.connect()
-    
-    if not await client.is_user_authorized():
-        await client.disconnect()
-        raise RuntimeError("Historical Client not authorized. Run auth script for 'historical_session'.")
+_IST = timezone(timedelta(hours=5, minutes=30))
 
-    raw_messages = []
-    try:
-        # 1. Robust Entity Finding (Your trick from run_pipeline)
+
+def _make_client() -> TelegramClient:
+    session = os.environ["TG_SESSION_NAME"]
+    api_id = int(os.environ["TG_API_ID"])
+    api_hash = os.environ["TG_API_HASH"]
+    return TelegramClient(session, api_id, api_hash)
+
+
+async def scrape_historical_messages(channel_input: str, start_date: datetime):
+    """
+    Returns (messages, resolved_channel_id, resolved_channel_name).
+    Each message dict: {message_id, text, time}.
+    """
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=timezone.utc)
+
+    async with _make_client() as client:
+        if not await client.is_user_authorized():
+            raise RuntimeError(
+                "Telegram session expired. Run scripts/telegram_auth.py."
+            )
+
         target_entity = None
-        async for dialog in client.iter_dialogs(limit=150):
-            if dialog.name == channel_name:
-                target_entity = dialog.entity
-                break
-                
+        resolved_id = None
+        resolved_name = None
+        clean = str(channel_input).strip()
+
+        # Fast path: direct resolution
+        try:
+            target_entity = await client.get_entity(clean)
+            resolved_id = str(target_entity.id)
+            resolved_name = getattr(target_entity, "title", clean)
+            log.info("Fast-path resolved: %s (%s)", resolved_name, resolved_id)
+        except ChannelPrivateError:
+            raise
+        except Exception as e:
+            log.warning("Direct entity fetch failed (%s). Falling back to dialogs.", e)
+            no_at = clean.lstrip("@")
+            async for dialog in client.iter_dialogs(limit=50):
+                has_un = hasattr(dialog.entity, "username") and dialog.entity.username
+                if (
+                    str(dialog.id) == no_at
+                    or dialog.name.strip() == clean.strip()
+                    or (has_un and dialog.entity.username.lower() == no_at.lower())
+                ):
+                    target_entity = dialog.entity
+                    resolved_id = str(dialog.id)
+                    resolved_name = dialog.name
+                    break
+
         if not target_entity:
-            print(f"❌ Scraper could not find channel in dialogs: {channel_name}")
-            return []
+            log.error("Could not resolve channel: %s", channel_input)
+            return [], None, None
 
-        # 2. Timezone alignment (Telethon uses UTC)
-        if start_date.tzinfo is None:
-            start_date = start_date.replace(tzinfo=timezone.utc)
+        raw_messages = []
+        attempt = 0
+        while attempt < 2:
+            try:
+                async for message in client.iter_messages(target_entity):
+                    if message.date < start_date:
+                        break
+                    if message.text:
+                        raw_messages.append({
+                            "message_id": str(message.id),
+                            "text": message.text,
+                            "time": message.date.astimezone(_IST),
+                        })
+                break
+            except FloodWaitError as e:
+                wait = e.seconds + 5
+                log.warning("FloodWait: sleeping %ds", wait)
+                await asyncio.sleep(wait)
+                attempt += 1
+                if attempt >= 2:
+                    raise
 
-        # 3. Fetching the data backwards in time
-        async for message in client.iter_messages(target_entity):
-            if message.date < start_date:
-                break # We've gone past the 1-month lookback, stop fetching!
-                
-            if message.text: # Only grab text
-                raw_messages.append({
-                    "text": message.text,
-                    "time": message.date,
-                    "id": str(message.id)
-                })
-                
-        # 4. Reverse the list so the oldest messages are processed first (chronological order)
         raw_messages.reverse()
-        
-    except Exception as e:
-        print(f"Scraping Error: {e}")
-    finally:
-        await client.disconnect()
-        
-    return raw_messages
+        return raw_messages, resolved_id, resolved_name

@@ -50,7 +50,7 @@ declare module '$env/static/private' {
 	export const ComSpec: string;
 	export const DriverData: string;
 	export const EDITOR: string;
-	export const EFC_4552_1592913036: string;
+	export const EFC_9024_1592913036: string;
 	export const GIT_ASKPASS: string;
 	export const GK_GL_ADDR: string;
 	export const GK_GL_PATH: string;
@@ -117,6 +117,8 @@ declare module '$env/static/private' {
 	export const USERDOMAIN_ROAMINGPROFILE: string;
 	export const USERNAME: string;
 	export const USERPROFILE: string;
+	export const VIRTUAL_ENV: string;
+	export const VIRTUAL_ENV_PROMPT: string;
 	export const VS140COMNTOOLS: string;
 	export const VSCODE_DEBUGPY_ADAPTER_ENDPOINTS: string;
 	export const VSCODE_GIT_ASKPASS_EXTRA_ARGS: string;
@@ -127,6 +129,7 @@ declare module '$env/static/private' {
 	export const VSCODE_PYTHON_AUTOACTIVATE_GUARD: string;
 	export const windir: string;
 	export const ZES_ENABLE_SYSMAN: string;
+	export const _OLD_VIRTUAL_PATH: string;
 }
 
 /**
@@ -225,7 +228,7 @@ declare module '$env/dynamic/private' {
 		ComSpec: string;
 		DriverData: string;
 		EDITOR: string;
-		EFC_4552_1592913036: string;
+		EFC_9024_1592913036: string;
 		GIT_ASKPASS: string;
 		GK_GL_ADDR: string;
 		GK_GL_PATH: string;
@@ -292,6 +295,8 @@ declare module '$env/dynamic/private' {
 		USERDOMAIN_ROAMINGPROFILE: string;
 		USERNAME: string;
 		USERPROFILE: string;
+		VIRTUAL_ENV: string;
+		VIRTUAL_ENV_PROMPT: string;
 		VS140COMNTOOLS: string;
 		VSCODE_DEBUGPY_ADAPTER_ENDPOINTS: string;
 		VSCODE_GIT_ASKPASS_EXTRA_ARGS: string;
@@ -302,6 +307,7 @@ declare module '$env/dynamic/private' {
 		VSCODE_PYTHON_AUTOACTIVATE_GUARD: string;
 		windir: string;
 		ZES_ENABLE_SYSMAN: string;
+		_OLD_VIRTUAL_PATH: string;
 		[key: `PUBLIC_${string}`]: undefined;
 		[key: `${string}`]: string | undefined;
 	}

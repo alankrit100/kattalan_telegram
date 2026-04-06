@@ -32,631 +32,670 @@ print("✅ Success! Open latest_code.txt, copy everything, and paste it here.")
 ==================================================
 FILE: .\backend\main.py
 ==================================================
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta
-import logging
-import os
 import json
-import asyncio
-import pytz
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
 
-from core.utils import is_potential_signal
-from core.orchestrator import KattalanOrchestrator
-from data.provider_fyers import FyersDataProvider
+from dotenv import load_dotenv
+import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+
+print("Loading .env from:", ENV_PATH)  # debug
+load_dotenv(ENV_PATH)
+
+print("TG_SESSION_NAME:", os.getenv("TG_SESSION_NAME"))  # debug
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
 from core.scraper import scrape_historical_messages
+from core.orchestrator import KattalanOrchestrator
+from data.fyers_provider import FyersDataProvider
 
-# Set up logging for terminal visibility
+log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# 1. Initialize the App and CORS exactly ONCE
-app = FastAPI(title="Kattalan Live Engine")
+_orchestrator: KattalanOrchestrator = None
+_TIMEFRAME_MAP = {"1_month": 1, "3_months": 3, "6_months": 6}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _orchestrator
+    provider = FyersDataProvider()
+    _orchestrator = KattalanOrchestrator(provider)
+    log.info("Kattalan Quant Engine ready.")
+    yield
+    log.info("Shutting down.")
+
+
+app = FastAPI(title="Kattalan Quant Engine", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 2. Initialize the Engine on Startup
-try:
-    provider = FyersDataProvider()
-    orchestrator = KattalanOrchestrator(provider)
-    logger.info("Kattalan Engine Successfully Initialized.")
-except Exception as e:
-    logger.error(f"FATAL: Could not initialize orchestrator. {str(e)}")
-    orchestrator = None
 
-# --- WEBHOOK ENDPOINT ---
-@app.post("/webhook/telegram")
-async def telegram_webhook(payload: dict):
-    if not orchestrator:
-        raise HTTPException(status_code=500, detail="Engine offline.")
+@app.get("/health")
+async def health():
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
-    try:
-        message_block = (
-            payload.get("message") or
-            payload.get("channel_post") or
-            payload.get("edited_message") or
-            payload.get("edited_channel_post")
-        )
 
-        if not message_block or "text" not in message_block:
-            return {"status": "ignored", "reason": "Not a text message"}
-
-        raw_text = message_block["text"]
-
-        if not is_potential_signal(raw_text):
-            return {"status": "ignored", "reason": "Not a trading signal"}
-
-        ist = pytz.timezone("Asia/Kolkata")
-        unix_time = message_block["date"]
-        message_time = datetime.fromtimestamp(unix_time, tz=ist)
-
-        message_id = str(message_block.get("message_id"))
-        channel_id = str(message_block.get("chat", {}).get("id"))
-        is_edited = "edit_date" in message_block
-
-        logger.info(f"[{channel_id}] {message_time} | {raw_text[:30]}...")
-
-        result = orchestrator.process_live_message(
-            raw_text=raw_text,
-            message_time=message_time,
-            channel_id=channel_id,
-            message_id=message_id
-        )
-
-        return {
-            "status": "success",
-            "edited": is_edited,
-            "evaluation": result.model_dump()
-        }
-
-    except Exception as e:
-        logger.exception("Processing Error")
-        return {"status": "error", "message": str(e)}
-
-# --- WEBSOCKET ENDPOINT ---
 @app.websocket("/api/ws/audit")
-async def audit_channel_websocket(websocket: WebSocket):
+async def ws_audit(websocket: WebSocket):
     await websocket.accept()
-    
-    if not orchestrator:
-        await websocket.send_json({"progress": 0, "status": "ERROR: Engine Offline"})
-        return
-        
+
+    async def ws_send(data: str):
+        await websocket.send_text(data)
+
     try:
-        data = await websocket.receive_text()
-        request_data = json.loads(data)
-        
-        channel_name = request_data.get("channel_name")
-        timeframe = request_data.get("timeframe", "1_month")
-        
-        days_map = {"1_month": 30, "3_months": 90, "6_months": 180}
-        lookback_days = days_map.get(timeframe, 30)
-        start_date = datetime.now() - timedelta(days=lookback_days)
-        
-        await websocket.send_json({"progress": 5, "status": f"Connecting to Telegram for {channel_name}..."})
-        
-        # Trigger the real scraper
-        raw_messages = await scrape_historical_messages(channel_name, start_date)
-        total_msgs = len(raw_messages)
-        
-        if total_msgs == 0:
-            await websocket.send_json({"progress": 100, "status": "No messages found."})
+        payload = await websocket.receive_json()
+        channel_input: str = payload.get("channel_input", "").strip()
+        timeframe_str: str = payload.get("timeframe", "1_month")
+        timeframe_months: int = _TIMEFRAME_MAP.get(timeframe_str, 1)
+
+        if not channel_input:
+            await ws_send(json.dumps({"progress": 100, "status": "FATAL ERROR: No channel provided."}))
             return
 
-        await websocket.send_json({"progress": 20, "status": f"Scraped {total_msgs} messages. Starting AI evaluation..."})
-        
-        success_count = 0
-        total_edge = 0.0
-        
-        for index, msg in enumerate(raw_messages):
-            try:
-                # Threaded math execution so UI doesn't freeze
-                result = await asyncio.to_thread(
-                    orchestrator.process_live_message,
-                    raw_text=msg["text"],
-                    message_time=msg["time"],
-                    channel_id=channel_name,
-                    message_id=msg["id"]
-                )
-                success_count += 1
-                
-                # Simple Edge aggregation for the UI
-                if result.status == "WIN":
-                    total_edge += 1.5 
-                elif result.status == "LOSS":
-                    total_edge -= 1.0
-                    
-            except Exception as e:
-                pass # Skip spam quietly
-                
-            current_progress = 20 + int((index / total_msgs) * 70)
-            await websocket.send_json({
-                "progress": current_progress, 
-                "status": f"Evaluated {index + 1}/{total_msgs} trades..."
-            })
-            await asyncio.sleep(0.5) # API rate limit protection
-            
-        await websocket.send_json({"progress": 95, "status": "Finalizing statistics..."})
-        
-        final_edge = round(total_edge / success_count, 2) if success_count > 0 else 0
-        color_grade = "green" if final_edge > 0 else "red"
-        
-        await websocket.send_json({
-            "progress": 100, 
-            "status": "Audit Complete! Saved to Supabase.",
-            "results": {
-                "channel": channel_name,
-                "total_trades": success_count,
-                "win_rate": "TBD",
-                "edge_ratio": final_edge,
-                "color_grade": color_grade
-            }
-        })
+        await ws_send(json.dumps({"progress": 5, "status": "Connecting to Telegram..."}))
+
+        start_date = datetime.now(timezone.utc) - timedelta(days=30 * timeframe_months)
+        raw_messages, resolved_id, resolved_name = await scrape_historical_messages(
+            channel_input, start_date
+        )
+
+        if resolved_id is None:
+            await ws_send(json.dumps({
+                "progress": 100,
+                "status": f"FATAL ERROR: Channel '{channel_input}' not found.",
+            }))
+            return
+
+        await ws_send(json.dumps({"progress": 15, "status": f"Connected to {resolved_name}."}))
+
+        await _orchestrator.audit_channel(
+            channel_input=channel_input,
+            timeframe_months=timeframe_months,
+            raw_messages=raw_messages,
+            resolved_id=resolved_id,
+            resolved_name=resolved_name,
+            ws_send=ws_send,
+        )
 
     except WebSocketDisconnect:
-        logger.info("Frontend disconnected.")
+        log.info("Client disconnected mid-audit — pipeline continues saving to DB.")
+    except RuntimeError as e:
+        # Telegram session expired etc.
+        err = str(e)
+        log.error("Runtime error: %s", err)
+        try:
+            await ws_send(json.dumps({"progress": 100, "status": f"FATAL ERROR: {err}"}))
+        except Exception:
+            pass
     except Exception as e:
-        await websocket.send_json({"progress": 0, "status": f"FATAL ERROR: {str(e)}"})
-
-# --- HEALTH CHECK ---
-@app.get("/health")
-def health_check():
-    status = "Online" if orchestrator else "Offline"
-    return {"status": f"Kattalan is {status}."}
-
-==================================================
-FILE: .\backend\make_csv.py
-==================================================
-import pandas as pd
-import os
-
-# Create the data folder if it doesn't exist
-os.makedirs("data", exist_ok=True)
-
-# Create 3 minutes of mock market data
-data = {
-    "timestamp": [
-        "2023-01-01 09:59:00", 
-        "2023-01-01 10:00:00", 
-        "2023-01-01 10:01:00"
-    ],
-    "symbol": ["BANKNIFTY", "BANKNIFTY", "BANKNIFTY"],
-    "open": [48000.0, 48010.0, 48050.0],
-    "high": [48020.0, 48060.0, 48110.0],
-    "low": [47990.0, 48000.0, 48040.0],
-    "close": [48010.0, 48050.0, 48100.0]
-}
-
-pd.DataFrame(data).to_csv("data/live_data.csv", index=False)
-print("Success! data/live_data.csv created.")
-
-==================================================
-FILE: .\backend\test_db.py
-==================================================
-from datetime import datetime
-from core.parser import SignalParser
-from core.quant_engine import QuantEngine
-from core.repository import SupabaseRepository
-from core.schemas import OHLC
-
-# 1. Initialize our components
-parser = SignalParser()
-engine = QuantEngine()
-db = SupabaseRepository()
-
-# 2. Parse a fake telegram message
-raw_text = "BUY BANKNIFTY ABOVE 48000 SL 47900 TGT 48100 48200"
-signal = parser.parse(
-    raw_text=raw_text, 
-    message_time=datetime(2023, 1, 1, 9, 59),
-    channel_id="TEST_CHANNEL_01",
-    message_id="MSG_001"
-)
-
-# 3. Create a winning market scenario
-market_data = [
-    OHLC(timestamp=datetime(2023, 1, 1, 10, 0), open=48000.0, high=48050.0, low=47990.0, close=48010.0),
-    OHLC(timestamp=datetime(2023, 1, 1, 10, 1), open=48010.0, high=48210.0, low=48000.0, close=48200.0)
-]
-
-# 4. Run the math
-evaluation = engine.evaluate(signal, market_data)
-
-# 5. PUSH TO CLOUD
-print("Pushing Signal to Supabase...")
-db.upsert_signal(signal)
-
-print("Pushing Evaluation to Supabase...")
-db.upsert_evaluation(evaluation)
-
-print("✅ Success! Go check your Supabase dashboard.")
-
-==================================================
-FILE: .\backend\test_llm.py
-==================================================
-from datetime import datetime
-from core.parser import SignalParser
-
-parser = SignalParser()
-
-# Notice how messy this is, and it includes "27th march expiry"
-messy_telegram_text = "guys load up on banknifty 48k calls right now above 400. 27th march expiry!! keep strict stoploss at 350. aim for 450 and 500. don't miss this one 🔥🚀"
-
-print("Sending messy text to AI Parser...")
-result = parser.parse(
-    raw_text=messy_telegram_text,
-    message_time=datetime.now(),
-    channel_id="ALPHA_TRADERS",
-    message_id="MSG_002" # changed ID for the test
-)
-
-print("\n✅ AI Successfully Extracted Instrument Data:")
-print(result["instrument_data"].model_dump_json(indent=2))
+        log.exception("Unhandled error in ws_audit")
+        try:
+            await ws_send(json.dumps({"progress": 100, "status": f"FATAL ERROR: {e}"}))
+        except Exception:
+            pass
 
 ==================================================
 FILE: .\backend\core\orchestrator.py
 ==================================================
-from datetime import datetime
+import os
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Callable
+
 from core.parser import SignalParser
 from core.quant_engine import QuantEngine
-from core.schemas import EvaluationResult
+from core.repository import SupabaseRepository, RepositoryError
+from core.schemas import ChannelAuditResult, EvaluationResult
 from data.provider_base import MarketDataProvider
-from core.repository import SupabaseRepository
+from data.fyers_provider import build_fyers_symbol
 
-def build_fyers_symbol(underlying: str, instr_type: str) -> str:
-    """Converts the Telegram asset name into a valid Fyers ticker."""
-    underlying = underlying.upper().strip()
-    
-    # 1. Handle Commodities (MCX)
-    if underlying in ["CRUDEOIL", "NATURALGAS", "GOLD", "SILVER"]:
-        # We route to the continuous MCX spot/index for the math evaluation
-        return f"MCX:{underlying}-INDEX" 
-        
-    # 2. Handle Indices (NSE/BSE)
-    if "BANK" in underlying: return "NSE:NIFTYBANK-INDEX"
-    if "NIFTY" in underlying: return "NSE:NIFTY50-INDEX"
-    if "SENSEX" in underlying: return "BSE:SENSEX-INDEX"
-    if "FINNIFTY" in underlying: return "NSE:FINNIFTY-INDEX"
-    
-    # 3. Handle Equity Stocks
-    return f"NSE:{underlying}-EQ"
+log = logging.getLogger(__name__)
+
+_LOOKBACK = int(os.environ.get("LOOKBACK_MONTHS", "6"))
+_SEM_LIMIT = int(os.environ.get("SEMAPHORE_LIMIT", "8"))
+
 
 class KattalanOrchestrator:
-    """
-    The main nervous system of the backend. 
-    Wires the Parser, Data Provider, and Engine together.
-    """
-    
     def __init__(self, data_provider: MarketDataProvider):
         self.db = SupabaseRepository()
         self.provider = data_provider
         self.parser = SignalParser()
         self.engine = QuantEngine()
+        self.semaphore = asyncio.Semaphore(_SEM_LIMIT)
 
-    # NOTE: I removed the hardcoded `symbol` argument here. 
-    def process_live_message(self, raw_text: str, message_time: datetime, channel_id: str, message_id: str) -> EvaluationResult:
+    async def audit_channel(
+        self,
+        channel_input: str,
+        timeframe_months: int,
+        raw_messages: list,
+        resolved_id: str,
+        resolved_name: str,
+        ws_send: Callable,
+    ) -> ChannelAuditResult:
+        total_msgs = len(raw_messages)
+        channel_id = resolved_id or channel_input
+
+        async def emit(progress: int, status: str, results=None):
+            frame = {"progress": progress, "status": status}
+            if results:
+                frame["results"] = results
+            try:
+                await ws_send(json.dumps(frame))
+            except Exception:
+                pass  # Client disconnected — continue pipeline, results saved to DB
+
+        if total_msgs == 0:
+            await emit(100, "No messages found in timeframe.")
+            return ChannelAuditResult(
+                channel_name=resolved_name or channel_input,
+                channel_id=channel_id,
+                total_messages_scraped=0,
+            )
+
+        await emit(15, f"Scraped {total_msgs} messages. Checking cache...")
+
+        # --- SPAM CACHE: get only unseen message IDs ---
+        all_ids = [m["message_id"] for m in raw_messages]
         try:
-            # 1. Parse the chaotic human text
-            parsed_data = self.parser.parse(raw_text, message_time, channel_id, message_id)
+            unseen_ids = set(self.db.get_unseen_messages(channel_id, all_ids))
+        except RepositoryError:
+            log.warning("Spam cache unavailable — processing all messages.")
+            unseen_ids = set(all_ids)
+
+        unseen_messages = [m for m in raw_messages if m["message_id"] in unseen_ids]
+        await emit(25, f"{len(unseen_messages)} new messages to parse ({total_msgs - len(unseen_messages)} cached).")
+
+        # --- PARSE ---
+        all_signals = await self.parser.parse_all(
+            unseen_messages,
+            channel_id,
+            mark_processed_fn=self.db.mark_processed,
+        )
+        await emit(40, f"Parsed {len(all_signals)} valid signals.")
+
+        # --- FETCH MARKET DATA & EVALUATE (ONLY FOR NEW SIGNALS) ---
+        if all_signals:
+            await emit(70, f"Fetching market data for {len(all_signals)} new signals...")
             
-            # --- THE FIX: Extract the actual Pydantic object ---
-            signal = parsed_data["signal"]
+            fyers_rate_limiter = asyncio.Semaphore(5)  # Fyers allows 5 requests/sec — this is a simple in-memory throttle
             
-            # 2. Dynamically build the ticker (Handles Equities AND Options now)
-            dynamic_symbol = build_fyers_symbol(signal.underlying, signal.instrument_type)
+            # 1. Parallelize Fyers Network Calls
+            async def fetch_data(item):
+                sig = item["signal"]
+                symbol = build_fyers_symbol(sig.underlying, sig.instrument_type)
+                end_of_day = sig.issued_at.replace(hour=15, minute=30, second=0, microsecond=0)
+                if end_of_day.tzinfo is None:
+                    end_of_day = end_of_day.replace(tzinfo=timezone.utc)
+                
+                # Prevent Fyers SDK from blocking the main thread
+                data = await asyncio.to_thread(
+                    self.provider.fetch_1m_data, symbol, sig.issued_at, end_of_day
+                )
+                return sig.signal_id, data
+
+            fetch_tasks = [fetch_data(item) for item in all_signals]
+            fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+            candles_map: dict[str, list] = {}
+            for res in fetch_results:
+                if isinstance(res, Exception):
+                    log.error("Fyers fetch failed: %s", res)
+                else:
+                    candles_map[res[0]] = res[1]
+
+            # 2. Parallelize Quant Engine Math
+            async def evaluate_one(item):
+                sig = item["signal"]
+                candles = candles_map.get(sig.signal_id, [])
+                async with self.semaphore:
+                    return await asyncio.to_thread(self.engine.evaluate, sig, candles)
+
+            tasks = [evaluate_one(item) for item in all_signals]
+            eval_results: list[EvaluationResult] = await asyncio.gather(*tasks, return_exceptions=True)
+
+            await emit(90, "Evaluations complete. Saving new results to database...")
+
+            for item, result in zip(all_signals, eval_results):
+                if isinstance(result, Exception):
+                    log.error("evaluate() raised: %s", result)
+                    continue
+                try:
+                    self.db.upsert_signal(item["signal"])
+                    self.db.upsert_evaluation(result)
+                except RepositoryError as e:
+                    log.error("DB write failed for %s: %s", result.signal_id, e)
+
+        # --- AGGREGATE ALL HISTORICAL DATA FOR THIS CHANNEL ---
+        await emit(95, "Aggregating historical audit data...")
+        
+        # Pull everything we have ever evaluated for this channel
+        all_evals = self.db.get_evaluations_by_channel(channel_id)
+        
+        if not all_evals:
+            await emit(100, "No valid trade signals found.")
+            return ChannelAuditResult(
+                channel_name=resolved_name or channel_input,
+                channel_id=channel_id,
+                total_messages_scraped=total_msgs,
+            )
+
+        wins = losses = squared = expired = 0
+        win_pnls, loss_pnls, mfes, maes = [], [], [], []
+
+        for result in all_evals:
+            if result.status == "WIN":
+                wins += 1
+                win_pnls.append(result.pnl_percentage)
+            elif result.status == "LOSS":
+                losses += 1
+                loss_pnls.append(result.pnl_percentage)
+            elif result.status == "SQUARED_OFF":
+                squared += 1
+            elif result.status == "EXPIRED":
+                expired += 1
+
+            mfes.append(result.max_favorable_excursion)
+            maes.append(result.max_adverse_excursion)
+
+        decided = wins + losses
+        win_rate = (wins / decided * 100) if decided > 0 else 0.0
+
+        avg_win = (sum(win_pnls) / len(win_pnls)) if win_pnls else 0.0
+        avg_loss = (sum(loss_pnls) / len(loss_pnls)) if loss_pnls else 0.0
+        #prevent 0.0 edge ration if channel as a 100% win rate:
+        if avg_loss != 0:
+            edge_ratio = avg_win / abs(avg_loss)
+        else:
+            edge_ratio = avg_win if avg_win > 0 else 0.0
             
-            # 3. Define the evaluation window 
-            end_time = message_time.replace(hour=15, minute=30, second=0)
-            
-            # 4. Fetch the pristine 1-minute OHLC data 
-            market_data = self.provider.fetch_1m_data(dynamic_symbol, message_time, end_time)
-            
-            # 5. Run the deterministic math
-            result = self.engine.evaluate(signal, market_data)
-            
-            self.db.upsert_signal(signal)
-            self.db.upsert_evaluation(result)
-            
-            return result
-            
-        except Exception as e:
-            raise RuntimeError(f"Orchestration Failed: {str(e)}")
+        audit = ChannelAuditResult(
+            channel_name=resolved_name or channel_input,
+            channel_id=channel_id,
+            total_messages_scraped=total_msgs,
+            total_trades=decided,
+            total_wins=wins,
+            total_losses=losses,
+            total_squared_off=squared,
+            total_expired=expired,
+            win_rate_pct=round(win_rate, 2),
+            edge_ratio=round(edge_ratio, 3),
+            avg_mfe=round(sum(mfes) / len(mfes), 2) if mfes else 0.0,
+            avg_mae=round(sum(maes) / len(maes), 2) if maes else 0.0,
+        )
+
+        await emit(100, "Audit complete.", results=audit.model_dump())
+        return audit
 
 ==================================================
 FILE: .\backend\core\parser.py
 ==================================================
 import os
-import uuid
-from datetime import datetime
-from typing import List, Literal, Optional, Dict
+import asyncio
+import json
+import logging
+from typing import List, Dict, Optional, Literal
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
-from core.schemas import Signal
+from google.api_core.exceptions import ResourceExhausted
 
-load_dotenv()
+from core.schemas import Signal, make_signal_id
 
-# 1. Single Signal Schema
-class ExtractedSignal(BaseModel):
-    underlying: str = Field(description="The base asset, e.g., BANKNIFTY, NIFTY, RELIANCE")
-    instrument_type: Literal["CE", "PE", "EQ"] = Field(description="CE for Call, PE for Put, EQ for Equity/Spot")
-    strike: Optional[int] = Field(description="Strike price if options, null if equity", default=None)
+log = logging.getLogger(__name__)
+
+BATCH_SIZE = int(os.environ.get("GEMINI_BATCH_SIZE", "25"))
+
+_PROMPT_PREFIX = """You are a strict quantitative extraction engine for Indian equity/commodity markets.
+I am giving you a batch of Telegram messages. Find ONLY messages with a CLEAR trading signal.
+Return JSON: {"valid_signals": [...]}
+
+RULES:
+1. PAID/HIDDEN SL: compute mechanically. BUY → entry*0.85, SELL → entry*1.15
+2. All price fields MUST be floats. No text.
+3. message_id MUST be the exact string from the batch.
+4. instrument_type: ONLY "EQ" or "FUT". If the message is an options trade (CE, PE, CALL, PUT), OMIT IT ENTIRELY.
+5. Normalise underlying to official NSE/BSE/MCX ticker. Examples:
+   adaniprt→ADANIPORTS, sbi→SBIN, crude→CRUDEOIL, nifty bank→BANKNIFTY
+6. Messages may be in English, Hindi, or mixed language.
+7. If a message is not a trade signal, omit it entirely.
+
+BATCH:
+"""
+
+class _ExtractedSignal(BaseModel):
+    message_id: str
+    underlying: str
+    instrument_type: Literal["EQ", "FUT"]
+    strike: Optional[int] = None
     direction: Literal["BUY", "SELL"]
     entry_price: float
     stop_loss: float
     targets: List[float]
 
-# 2. Batch Signal Schema (Maps back to the Telegram message ID)
-class BatchExtractedSignal(ExtractedSignal):
-    message_id: str = Field(description="The exact message ID provided in the prompt mapping to this signal")
+class _BatchResponse(BaseModel):
+    valid_signals: List[_ExtractedSignal] = Field(default_factory=list)
 
-class BatchResponse(BaseModel):
-    valid_signals: List[BatchExtractedSignal] = Field(description="List of valid trading signals found in the batch.")
 
 class SignalParser:
     def __init__(self):
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            raise ValueError("FATAL: Missing GEMINI_API_KEY in .env file.")
+            raise ValueError("FATAL: Missing GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key)
+        self.model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
-    def parse(self, raw_text: str, message_time: datetime, channel_id: str, message_id: str):
-        """Used by main.py for LIVE incoming messages."""
-        prompt = f"""
-        Analyze this Telegram trading signal posted on {message_time.strftime('%Y-%m-%d %H:%M:%S')}.
-        Extract the exact trading parameters. If NOT a clear signal, fail.
-        Raw Text: "{raw_text}"
+    async def parse_all(
+        self,
+        messages: List[Dict],
+        channel_id: str,
+        mark_processed_fn=None,
+    ) -> List[Dict]:
         """
+        Splits messages into batches, dispatches all batches concurrently,
+        returns flat list of {"signal": Signal, ...} dicts.
+        """
+        batches = [
+            messages[i: i + BATCH_SIZE]
+            for i in range(0, len(messages), BATCH_SIZE)
+        ]
+        tasks = [
+            self._parse_batch(batch, channel_id, mark_processed_fn)
+            for batch in batches
+        ]
+        results_nested = await asyncio.gather(*tasks, return_exceptions=True)
+
+        flat = []
+        for r in results_nested:
+            if isinstance(r, Exception):
+                log.error("Batch parse error: %s", r)
+            else:
+                flat.extend(r)
+        return flat
+
+    async def _parse_batch(
+        self,
+        batch: List[Dict],
+        channel_id: str,
+        mark_processed_fn=None,
+    ) -> List[Dict]:
+        if not batch:
+            return []
+
+        prompt = _PROMPT_PREFIX
+        for item in batch:
+            prompt += f"--- MESSAGE ID: {item['message_id']} ---\n{item['text']}\n\n"
+
+        raw_text = await self._call_gemini_with_backoff(prompt)
+        if raw_text is None:
+            # Mark all as unprocessed so they can be retried
+            if mark_processed_fn:
+                for item in batch:
+                    asyncio.create_task(
+                        mark_processed_fn(channel_id, item["message_id"], False)
+                    )
+            return []
+
         try:
-            response = self.client.models.generate_content(
-                model='gemini-2.5-flash-lite',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ExtractedSignal,
-                    temperature=0.0,
-                ),
-            )
-            extracted = ExtractedSignal.model_validate_json(response.text)
-            
-            # --- THE FIX: Fully populated Signal object ---
-            signal = Signal(
-                signal_id=str(uuid.uuid4()), 
-                channel_id=channel_id, 
-                message_id=message_id,
-                raw_text=raw_text, 
-                underlying=extracted.underlying,             # NEW
-                instrument_type=extracted.instrument_type,   # NEW
-                strike=extracted.strike,                     # NEW
-                direction=extracted.direction, 
-                entry_price=extracted.entry_price,
-                stop_loss=extracted.stop_loss, 
-                targets=extracted.targets, 
-                is_intraday=True, 
-                issued_at=message_time
-            )
-            
-            # --- THE FIX: Return the dictionary contract ---
-            return {"signal": signal, "instrument_data": extracted}
-            
+            clean = raw_text.replace("```json", "").replace("```", "").strip()
+            parsed = _BatchResponse.model_validate_json(clean)
         except Exception as e:
-            raise ValueError(f"LLM Parsing failed: {e}")
+            log.error("JSON parse failed for batch: %s | raw: %.200s", e, raw_text)
+            if mark_processed_fn:
+                for item in batch:
+                    asyncio.create_task(
+                        mark_processed_fn(channel_id, item["message_id"], False)
+                    )
+            return []
 
-    def parse_batch(self, batch_data: List[Dict], channel_id: str):
-        """Used by run_pipeline.py to process HISTORICAL messages at once."""
-        if not batch_data: return []
+        msg_map = {str(m["message_id"]): m for m in batch}
+        results = []
 
-        prompt = """You are a strict quantitative extraction engine. 
-I am giving you a batch of Telegram messages. Most of them are useless spam.
-Find ONLY the messages that contain a CLEAR trading signal.
-A clear signal MUST have:
-1. An instrument (e.g., BANKNIFTY, RELIANCE)
-2. A direction (BUY or SELL)
-3. An entry price
-4. A stop loss (SL)
-5. At least one target (TGT)
+        for extracted in parsed.valid_signals:
+            original = msg_map.get(extracted.message_id)
+            if not original:
+                continue
 
-For every valid signal you find, extract the data and include the EXACT 'message_id' I provided. If a message is spam, conversational, or missing exact numbers, IGNORE IT completely.
-
-Here is the batch:
-"""
-        for item in batch_data:
-            prompt += f"--- MESSAGE ID: {item['message_id']} ---\nText: {item['text']}\n\n"
-
-        try:
-            response = self.client.models.generate_content(
-                model='gemini-2.5-flash-lite',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=BatchResponse,
-                    temperature=0.0,
-                ),
+            # Sort targets per direction
+            extracted.targets = (
+                sorted(extracted.targets)
+                if extracted.direction == "BUY"
+                else sorted(extracted.targets, reverse=True)
             )
-            
-            parsed_batch = BatchResponse.model_validate_json(response.text)
-            results = []
-            
-            for extracted in parsed_batch.valid_signals:
-                original_msg = next((msg for msg in batch_data if msg['message_id'] == extracted.message_id), None)
-                if not original_msg: continue
-                    
+
+            try:
                 signal = Signal(
-                    signal_id=str(uuid.uuid4()), 
-                    channel_id=channel_id, 
-                    message_id=extracted.message_id, # Or message_id for the single parse method
-                    raw_text=original_msg['text'],   # Or raw_text for the single parse method
-                    underlying=extracted.underlying,           # <-- NEW
-                    instrument_type=extracted.instrument_type, # <-- NEW
-                    strike=extracted.strike,                   # <-- NEW
-                    direction=extracted.direction, 
+                    channel_id=channel_id,
+                    message_id=extracted.message_id,
+                    raw_text=original["text"],
+                    underlying=extracted.underlying,
+                    instrument_type=extracted.instrument_type,
+                    strike=extracted.strike,
+                    direction=extracted.direction,
                     entry_price=extracted.entry_price,
-                    stop_loss=extracted.stop_loss, 
-                    targets=extracted.targets, 
-                    is_intraday=True, 
-                    issued_at=original_msg['time']   # Or message_time for the single parse method
+                    stop_loss=extracted.stop_loss,
+                    targets=extracted.targets,
+                    is_intraday=True,
+                    issued_at=original["time"],
                 )
-                results.append({"signal": signal, "instrument_data": extracted})
-                
-            return results
-        except Exception as e:
-            raise ValueError(f"Batch LLM Parsing failed: {e}")
+            except Exception as e:
+                log.warning("Signal validation failed (msg %s): %s", extracted.message_id, e)
+                if mark_processed_fn:
+                    asyncio.create_task(
+                        mark_processed_fn(channel_id, extracted.message_id, False)
+                    )
+                continue
+
+            if mark_processed_fn:
+                asyncio.create_task(
+                    mark_processed_fn(channel_id, extracted.message_id, True)
+                )
+            results.append({"signal": signal})
+
+        # Mark non-signal messages
+        parsed_ids = {e.message_id for e in parsed.valid_signals}
+        if mark_processed_fn:
+            for item in batch:
+                if item["message_id"] not in parsed_ids:
+                    asyncio.create_task(
+                        mark_processed_fn(channel_id, item["message_id"], False)
+                    )
+
+        return results
+
+    async def _call_gemini_with_backoff(self, prompt: str) -> str | None:
+        for attempt in range(3):
+            try:
+                response = await asyncio.to_thread(
+                    self.client.models.generate_content,
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=_BatchResponse,
+                        temperature=0.0,
+                    ),
+                )
+                return response.text
+            except ResourceExhausted:
+                wait = 2 ** (attempt + 1)
+                log.warning("Gemini 429. Waiting %ds (attempt %d/3)", wait, attempt + 1)
+                await asyncio.sleep(wait)
+            except Exception as e:
+                log.error("Gemini call failed: %s", e)
+                return None
+        log.error("Gemini failed after 3 attempts.")
+        return None
 
 ==================================================
 FILE: .\backend\core\quant_engine.py
 ==================================================
+import logging
 from typing import List
 from datetime import time
 from core.schemas import Signal, OHLC, EvaluationResult
 
-class QuantEngine:
-    def __init__(self):
-        self.market_open = time(9, 15)
-        self.market_close = time(15, 30)
-        self.auto_square_off = time(15, 15)
+log = logging.getLogger(__name__)
 
+_OPEN = time(9, 15)
+_CLOSE = time(15, 30)
+_SQUAREOFF = time(15, 15)
+
+
+class QuantEngine:
+    """Strict Cash (EQ) and Futures (FUT) mathematical backtesting engine."""
+    
     def evaluate(self, signal: Signal, market_data: List[OHLC]) -> EvaluationResult:
         trace = []
         status = "PENDING"
-        entry_time = None
-        exit_time = None
-        executed_entry = None
-        executed_exit = None
-        
-        mfe = 0.0 # Max Favorable Excursion (Points gained)
-        mae = 0.0 # Max Adverse Excursion (Points lost)
-        
+        entry_time = exit_time = None
+        executed_entry = executed_exit = None
+        mfe = mae = 0.0
         current_sl = signal.stop_loss
         active_target_idx = 0
         is_active = False
 
-        # --- DUAL-THREAT ROUTING ---
-        is_option = signal.instrument_type in ["CE", "PE"]
+        # Failsafe: Reject options if they somehow make it past the parser
+        if signal.instrument_type in ("CE", "PE"):
+            trace.append("REJECTED: Options are not supported in the strict Cash/Futures engine.")
+            return self._result(signal, "EXPIRED", trace, None, None, None, None, 0.0, 0.0)
 
-        if is_option:
-            trace.append(f"INIT: Evaluating {signal.instrument_type} Option as Spot Directional Edge.")
-        else:
-            trace.append(f"INIT: Evaluating {signal.direction} Equity signal at {signal.entry_price}.")
+        trace.append(
+            f"INIT: {signal.instrument_type} {signal.direction} | "
+            f"entry={signal.entry_price} sl={signal.stop_loss} targets={signal.targets}"
+        )
+
+        if not market_data:
+            return self._result(signal, "EXPIRED", trace, entry_time, exit_time,
+                                executed_entry, executed_exit, mfe, mae)
 
         for candle in market_data:
             c_time = candle.timestamp.time()
-            
-            # Market hours check
-            if c_time < self.market_open or c_time > self.market_close:
+            if c_time < _OPEN or c_time > _CLOSE:
                 continue
 
-            # 1. ENTRY LOGIC
+            # --- ENTRY ---
             if not is_active:
-                if is_option:
-                    # Enter immediately at the exact Spot price when the Telegram message dropped
+                if signal.direction == "BUY" and candle.high >= signal.entry_price:
                     is_active = True
                     entry_time = candle.timestamp
-                    executed_entry = candle.open
-                    trace.append(f"[{c_time}] OPTION SIGNAL: Tracking Spot Index directional edge from {executed_entry}.")
-                else:
-                    # Standard Equity Gap-Up/Gap-Down Logic
-                    if signal.direction == "BUY" and candle.high >= signal.entry_price:
-                        is_active = True
-                        entry_time = candle.timestamp
-                        executed_entry = candle.open if candle.open > signal.entry_price else signal.entry_price
-                        trace.append(f"[{c_time}] ENTRY TRIGGERED at {executed_entry}.")
-                    elif signal.direction == "SELL" and candle.low <= signal.entry_price:
-                        is_active = True
-                        entry_time = candle.timestamp
-                        executed_entry = candle.open if candle.open < signal.entry_price else signal.entry_price
-                        trace.append(f"[{c_time}] ENTRY TRIGGERED at {executed_entry}.")
+                    executed_entry = max(candle.open, signal.entry_price)
+                    trace.append(f"[{c_time}] BUY ENTRY at {executed_entry}")
+                elif signal.direction == "SELL" and candle.low <= signal.entry_price:
+                    is_active = True
+                    entry_time = candle.timestamp
+                    executed_entry = min(candle.open, signal.entry_price)
+                    trace.append(f"[{c_time}] SELL ENTRY at {executed_entry}")
                 
                 if not is_active:
                     continue
 
-            # 2. EXCURSION TRACKING
-            assert executed_entry is not None
-            
-            # If it's a Call (CE) or Equity Buy, we want the chart to go UP
-            if signal.instrument_type == "CE" or (signal.instrument_type == "EQ" and signal.direction == "BUY"):
-                curr_mfe = candle.high - executed_entry
-                curr_mae = executed_entry - candle.low
-            # If it's a Put (PE) or Equity Sell, we want the chart to go DOWN
-            else: 
-                curr_mfe = executed_entry - candle.low
-                curr_mae = candle.high - executed_entry
-                
-            mfe = max(mfe, curr_mfe)
-            mae = max(mae, curr_mae)
+            # --- MFE / MAE ---
+            if executed_entry is None:
+                log.error("executed_entry is None despite is_active=True — signal %s", signal.signal_id)
+                break
 
-            # 3. AUTO-SQUARE OFF (Intraday)
-            if signal.is_intraday and c_time >= self.auto_square_off:
+            if signal.direction == "BUY":
+                mfe = max(mfe, candle.high - executed_entry)
+                mae = max(mae, executed_entry - candle.low)
+            else:
+                mfe = max(mfe, executed_entry - candle.low)
+                mae = max(mae, candle.high - executed_entry)
+
+            # --- AUTO SQUARE-OFF ---
+            if signal.is_intraday and c_time >= _SQUAREOFF:
                 status = "SQUARED_OFF"
                 exit_time = candle.timestamp
                 executed_exit = candle.close
-                reason_str = f"EOD SQUARED-OFF. MFE: {mfe:.2f}, MAE: {mae:.2f}" if is_option else f"INTRADAY SQUARE-OFF at {executed_exit}."
-                trace.append(f"[{c_time}] {reason_str}")
+                trace.append(f"[{c_time}] SQUARED OFF at {executed_exit}. MFE={mfe:.2f} MAE={mae:.2f}")
                 break
 
-            # 4. TARGET & STOP LOSS LOGIC (EQUITY ONLY)
-            if not is_option:
-                hit_sl = False
-                hit_target = False
+            # --- TARGET & SL LOGIC ---
+            hit_sl = False
+            hit_tgt = False
+            hit_price = 0.0
+            sl_execution_price = current_sl
 
-                if signal.direction == "BUY":
-                    if candle.low <= current_sl: hit_sl = True
-                    if active_target_idx < len(signal.targets) and candle.high >= signal.targets[active_target_idx]: 
-                        hit_target = True
-                else: # SELL
-                    if candle.high >= current_sl: hit_sl = True
-                    if active_target_idx < len(signal.targets) and candle.low <= signal.targets[active_target_idx]: 
-                        hit_target = True
+            if signal.direction == "BUY":
+                if candle.low <= current_sl:
+                    hit_sl = True
+                    sl_execution_price = min(candle.open, current_sl)
+                if active_target_idx < len(signal.targets) and candle.high >= signal.targets[active_target_idx]:
+                    hit_tgt = True
+                    hit_price = max(candle.open, signal.targets[active_target_idx])
+            else:  # SELL
+                if candle.high >= current_sl:
+                    hit_sl = True
+                    sl_execution_price = max(candle.open, current_sl)
+                if active_target_idx < len(signal.targets) and candle.low <= signal.targets[active_target_idx]:
+                    hit_tgt = True
+                    hit_price = min(candle.open, signal.targets[active_target_idx])
 
-                # Resolution
-                if hit_sl and hit_target:
-                    status = "LOSS"
+            if hit_sl and hit_tgt:
+                status = "LOSS"
+                exit_time = candle.timestamp
+                executed_exit = sl_execution_price
+                trace.append(
+                    f"[{c_time}] WICK CONFLICT: SL and target hit same candle. "
+                    f"Worst-case LOSS at {executed_exit}."
+                )
+                break
+
+            elif hit_sl:
+                status = "LOSS" if active_target_idx == 0 else "WIN"
+                exit_time = candle.timestamp
+                executed_exit = sl_execution_price
+                trace.append(f"[{c_time}] STOP LOSS HIT at {executed_exit}.")
+                break
+
+            elif hit_tgt:
+                hit_price = signal.targets[active_target_idx]
+                trace.append(f"[{c_time}] TARGET {active_target_idx + 1} HIT at {hit_price}.")
+                current_sl = executed_entry if active_target_idx == 0 else signal.targets[active_target_idx - 1]
+                trace.append(f"[{c_time}] SL trailed to {current_sl}.")
+                active_target_idx += 1
+
+                if active_target_idx >= len(signal.targets):
+                    status = "WIN"
                     exit_time = candle.timestamp
-                    executed_exit = current_sl
-                    trace.append(f"[{c_time}] WICK CONFLICT: Both Target and SL hit. Defaulting to worst-case (LOSS) at {executed_exit}.")
+                    executed_exit = hit_price
+                    trace.append(f"[{c_time}] ALL TARGETS CLEARED. Exit {executed_exit}.")
                     break
-                    
-                elif hit_sl:
-                    status = "LOSS" if active_target_idx == 0 else "WIN"
-                    exit_time = candle.timestamp
-                    executed_exit = current_sl
-                    trace.append(f"[{c_time}] STOP LOSS HIT at {executed_exit}.")
-                    break
-                    
-                elif hit_target:
-                    hit_price = signal.targets[active_target_idx]
-                    trace.append(f"[{c_time}] TARGET {active_target_idx + 1} HIT at {hit_price}.")
-                    
-                    if active_target_idx == 0:
-                        current_sl = executed_entry
-                        trace.append(f"[{c_time}] SL trailed to Entry ({current_sl}).")
-                    else:
-                        current_sl = signal.targets[active_target_idx - 1]
-                        trace.append(f"[{c_time}] SL trailed to previous Target ({current_sl}).")
-                    
-                    active_target_idx += 1
-                    
-                    if active_target_idx >= len(signal.targets):
-                        status = "WIN"
-                        exit_time = candle.timestamp
-                        executed_exit = hit_price
-                        trace.append(f"[{c_time}] ALL TARGETS CLEARED. Exiting at {executed_exit}.")
-                        break
 
-        # 5. END OF DATA CHECK
+        # --- END OF DATA ---
         if status == "PENDING":
             if not is_active:
                 status = "EXPIRED"
-                trace.append("DATA ENDED: Entry never triggered.")
+                trace.append("DATA ENDED: Entry never triggered → EXPIRED.")
             else:
-                status = "SQUARED_OFF" if is_option else "PENDING"
-                trace.append("DATA ENDED: Signal active but unresolved.")
+                status = "SQUARED_OFF"
+                executed_exit = market_data[-1].close if market_data else executed_entry
+                trace.append("DATA ENDED: Active signal closed at last candle → SQUARED_OFF.")
+
+        return self._result(signal, status, trace, entry_time, exit_time,
+                            executed_entry, executed_exit, mfe, mae)
+
+    @staticmethod
+    def _result(signal, status, trace, entry_time, exit_time,
+                executed_entry, executed_exit, mfe, mae) -> EvaluationResult:
+        pnl = 0.0
+        if status in ("WIN", "LOSS", "SQUARED_OFF") and executed_entry and executed_exit:
+            if signal.direction == "BUY":
+                pnl = (executed_exit - executed_entry) / executed_entry * 100.0
+            else:
+                pnl = (executed_entry - executed_exit) / executed_entry * 100.0
 
         return EvaluationResult(
             signal_id=signal.signal_id,
@@ -665,100 +704,336 @@ class QuantEngine:
             exit_time=exit_time,
             entry_executed_price=executed_entry,
             exit_executed_price=executed_exit,
-            max_favorable_excursion=mfe,
-            max_adverse_excursion=mae,
+            pnl_percentage=round(pnl, 4),
+            max_favorable_excursion=round(mfe, 4),
+            max_adverse_excursion=round(mae, 4),
             reason=trace[-1] if trace else "Unknown",
-            trace_log=trace
+            trace_log=trace,
+        )
+
+==================================================
+FILE: .\backend\core\quant_engine_options_legacy.py
+==================================================
+import logging
+from typing import List
+from datetime import time
+from core.schemas import Signal, OHLC, EvaluationResult
+
+log = logging.getLogger(__name__)
+
+_OPEN = time(9, 15)
+_CLOSE = time(15, 30)
+_SQUAREOFF = time(15, 15)
+
+class QuantEngineLegacy:
+    """Archived engine containing the spot-tracking logic for CE/PE options."""
+    def evaluate(self, signal: Signal, market_data: List[OHLC]) -> EvaluationResult:
+        trace = []
+        status = "PENDING"
+        entry_time = exit_time = None
+        executed_entry = executed_exit = None
+        mfe = mae = 0.0
+        current_sl = signal.stop_loss
+        active_target_idx = 0
+        is_active = False
+        is_option = signal.instrument_type in ("CE", "PE")
+        is_buy_dir = signal.direction == "BUY" or signal.instrument_type == "CE"
+
+        trace.append(f"INIT: {signal.instrument_type} {signal.direction} | entry={signal.entry_price}")
+
+        if not market_data:
+            return self._result(signal, "EXPIRED", trace, entry_time, exit_time, executed_entry, executed_exit, mfe, mae)
+
+        for candle in market_data:
+            c_time = candle.timestamp.time()
+            if c_time < _OPEN or c_time > _CLOSE: continue
+
+            # --- ENTRY ---
+            if not is_active:
+                if is_option:
+                    is_active = True
+                    entry_time = candle.timestamp
+                    executed_entry = candle.open
+                    trace.append(f"[{c_time}] OPTION ENTRY at spot {executed_entry}")
+                else:
+                    if signal.direction == "BUY" and candle.high >= signal.entry_price:
+                        is_active = True
+                        entry_time = candle.timestamp
+                        executed_entry = max(candle.open, signal.entry_price)
+                        trace.append(f"[{c_time}] BUY ENTRY at {executed_entry}")
+                    elif signal.direction == "SELL" and candle.low <= signal.entry_price:
+                        is_active = True
+                        entry_time = candle.timestamp
+                        executed_entry = min(candle.open, signal.entry_price)
+                        trace.append(f"[{c_time}] SELL ENTRY at {executed_entry}")
+                if not is_active: continue
+
+            # --- MFE / MAE ---
+            if executed_entry is None: break
+
+            if is_buy_dir:
+                mfe = max(mfe, candle.high - executed_entry)
+                mae = max(mae, executed_entry - candle.low)
+            else:
+                mfe = max(mfe, executed_entry - candle.low)
+                mae = max(mae, candle.high - executed_entry)
+
+            # --- AUTO SQUARE-OFF ---
+            if signal.is_intraday and c_time >= _SQUAREOFF:
+                status = "SQUARED_OFF"
+                exit_time = candle.timestamp
+                executed_exit = candle.close
+                trace.append(f"[{c_time}] SQUARED OFF at {executed_exit}. MFE={mfe:.2f} MAE={mae:.2f}")
+                break
+
+            # --- TARGET & SL LOGIC ---
+            hit_sl = hit_tgt = False
+            hit_price = 0.0
+            sl_execution_price = current_sl
+
+            if signal.direction == "BUY" or signal.instrument_type == "CE":
+                if candle.low <= current_sl:
+                    hit_sl = True
+                    sl_execution_price = min(candle.open, current_sl)
+                if active_target_idx < len(signal.targets) and candle.high >= signal.targets[active_target_idx]:
+                    hit_tgt = True
+                    hit_price = max(candle.open, signal.targets[active_target_idx])
+            else:
+                if candle.high >= current_sl:
+                    hit_sl = True
+                    sl_execution_price = max(candle.open, current_sl)
+                if active_target_idx < len(signal.targets) and candle.low <= signal.targets[active_target_idx]:
+                    hit_tgt = True
+                    hit_price = min(candle.open, signal.targets[active_target_idx])
+
+            if hit_sl and hit_tgt:
+                status = "LOSS"
+                exit_time = candle.timestamp
+                executed_exit = sl_execution_price
+                trace.append(f"[{c_time}] WICK CONFLICT: Worst-case LOSS at {executed_exit}.")
+                break
+            elif hit_sl:
+                status = "LOSS" if active_target_idx == 0 else "WIN"
+                exit_time = candle.timestamp
+                executed_exit = sl_execution_price
+                trace.append(f"[{c_time}] STOP LOSS HIT at {executed_exit}.")
+                break
+            elif hit_tgt:
+                trace.append(f"[{c_time}] TARGET {active_target_idx + 1} HIT at {hit_price}.")
+                current_sl = executed_entry if active_target_idx == 0 else signal.targets[active_target_idx - 1]
+                active_target_idx += 1
+                if active_target_idx >= len(signal.targets):
+                    status = "WIN"
+                    exit_time = candle.timestamp
+                    executed_exit = hit_price
+                    trace.append(f"[{c_time}] ALL TARGETS CLEARED. Exit {executed_exit}.")
+                    break
+
+        if status == "PENDING":
+            if not is_active:
+                status = "EXPIRED"
+                trace.append("DATA ENDED: Entry never triggered → EXPIRED.")
+            else:
+                status = "SQUARED_OFF"
+                executed_exit = market_data[-1].close if market_data else executed_entry
+                trace.append("DATA ENDED: Active signal closed at last candle → SQUARED_OFF.")
+
+        return self._result(signal, status, trace, entry_time, exit_time, executed_entry, executed_exit, mfe, mae)
+
+    @staticmethod
+    def _result(signal, status, trace, entry_time, exit_time, executed_entry, executed_exit, mfe, mae):
+        pnl = 0.0
+        if status in ("WIN", "LOSS", "SQUARED_OFF") and executed_entry and executed_exit:
+            if signal.direction == "BUY" or signal.instrument_type == "CE":
+                pnl = (executed_exit - executed_entry) / executed_entry * 100.0
+            else:
+                pnl = (executed_entry - executed_exit) / executed_entry * 100.0
+
+        return EvaluationResult(
+            signal_id=signal.signal_id, status=status, entry_time=entry_time, exit_time=exit_time,
+            entry_executed_price=executed_entry, exit_executed_price=executed_exit,
+            pnl_percentage=round(pnl, 4), max_favorable_excursion=round(mfe, 4), max_adverse_excursion=round(mae, 4),
+            reason=trace[-1] if trace else "Unknown", trace_log=trace,
         )
 
 ==================================================
 FILE: .\backend\core\repository.py
 ==================================================
 import os
-from dotenv import load_dotenv
+import asyncio
+import logging
+from datetime import timezone
 from supabase import create_client, Client
 from core.schemas import Signal, EvaluationResult
 
-# Load the .env file
-load_dotenv()
+log = logging.getLogger(__name__)
+
+
+class RepositoryError(Exception):
+    def __init__(self, message: str, original: Exception = None):
+        super().__init__(message)
+        self.original = original
+
 
 class SupabaseRepository:
     def __init__(self):
-        url: str = os.environ.get("SUPABASE_URL")
-        key: str = os.environ.get("SUPABASE_KEY")
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_KEY")
         if not url or not key:
-            raise ValueError("FATAL: Missing SUPABASE_URL or SUPABASE_KEY in .env file.")
-        
+            raise ValueError("FATAL: Missing SUPABASE_URL or SUPABASE_KEY in .env")
         self.supabase: Client = create_client(url, key)
+        
+        # Use single underscore to avoid strict python name mangling
+        self._db_semaphore = asyncio.Semaphore(15)
+
+    def get_unseen_messages(self, channel_id: str, message_ids: list[str]) -> list[str]:
+        """
+        Returns subset of message_ids not yet in processed_messages for this channel.
+        Set-difference executed in Postgres via LEFT JOIN / IS NULL.
+        """
+        if not message_ids:
+            return []
+        try:
+            # Use Postgres unnest + LEFT JOIN to do the set-difference server-side
+            # Supabase Python SDK doesn't support unnest directly, so we use rpc
+            response = self.supabase.rpc(
+                "get_unseen_message_ids",
+                {"p_channel_id": channel_id, "p_message_ids": message_ids},
+            ).execute()
+            return [row["message_id"] for row in (response.data or [])]
+        except Exception as e:
+            log.error("get_unseen_messages failed: %s", e)
+            raise RepositoryError("Failed to query unseen messages", e)
 
     def upsert_signal(self, signal: Signal):
-        """Inserts a new signal, or updates it if channel_id + message_id already exists."""
-        data = signal.model_dump()
-        
-        # Convert Python datetime to ISO format string for Postgres
-        data['issued_at'] = data['issued_at'].isoformat()
-        
-        # UPSERT logic: If there's a conflict on the unique constraint, update the row
-        response = self.supabase.table('signals').upsert(
-            data, on_conflict='channel_id,message_id'
-        ).execute()
-        
-        return response
+        try:
+            data = signal.model_dump()
+            data["issued_at"] = _to_utc_iso(data["issued_at"])
+            response = self.supabase.table("signals").upsert(
+                data, on_conflict="signal_id"
+            ).execute()
+            if response.data is None:
+                raise RepositoryError("upsert_signal returned no data")
+            return response
+        except RepositoryError:
+            raise
+        except Exception as e:
+            log.error("upsert_signal failed for %s: %s", signal.signal_id, e)
+            raise RepositoryError(f"upsert_signal failed: {e}", e)
 
-    def upsert_evaluation(self, eval_result: EvaluationResult):
-        """Inserts or updates the math evaluation tied to the signal."""
-        data = eval_result.model_dump()
-        
-        # Convert datetimes if they exist
-        if data.get('entry_time'): 
-            data['entry_time'] = data['entry_time'].isoformat()
-        if data.get('exit_time'): 
-            data['exit_time'] = data['exit_time'].isoformat()
+    def upsert_evaluation(self, result: EvaluationResult):
+        try:
+            data = result.model_dump()
+            data["entry_time"] = _to_utc_iso(data["entry_time"])
+            data["exit_time"] = _to_utc_iso(data["exit_time"])
+            response = self.supabase.table("evaluations").upsert(
+                data, on_conflict="signal_id"
+            ).execute()
+            if response.data is None:
+                raise RepositoryError("upsert_evaluation returned no data")
+            return response
+        except RepositoryError:
+            raise
+        except Exception as e:
+            log.error("upsert_evaluation failed for %s: %s", result.signal_id, e)
+            raise RepositoryError(f"upsert_evaluation failed: {e}", e)
+
+    def get_evaluations_by_channel(self, channel_id: str) -> list[EvaluationResult]:
+        """Fetches all past evaluations for a specific channel to build the final audit card."""
+        try:
+            # 1. Get all signal IDs belonging to this channel
+            sig_res = self.supabase.table("signals").select("signal_id").eq("channel_id", channel_id).execute()
+            sig_ids = [row["signal_id"] for row in (sig_res.data or [])]
             
-        # UPSERT logic based on the unique signal_id
-        response = self.supabase.table('evaluations').upsert(
-            data, on_conflict='signal_id'
+            if not sig_ids:
+                return []
+                
+            # 2. Fetch the evaluations matching those IDs
+            eval_res = self.supabase.table("evaluations").select("*").in_("signal_id", sig_ids).execute()
+            
+            # 3. Convert raw database rows back into Pydantic models
+            return [EvaluationResult(**row) for row in (eval_res.data or [])]
+        except Exception as e:
+            log.error("Failed to fetch historical evaluations: %s", e)
+            return []
+
+    async def mark_processed(self, channel_id: str, message_id: str, is_signal: bool):
+        """Fire-and-forget — guarded by semaphore to prevent socket exhaustion."""
+        try:
+            # The async with lock forces Python to wait if 15 DB calls are already happening
+            async with self._db_semaphore:
+                await asyncio.to_thread(
+                    self._sync_mark_processed, channel_id, message_id, is_signal
+                )
+        except Exception as e:
+            log.error("mark_processed failed (%s, %s): %s", channel_id, message_id, e)
+
+    def _sync_mark_processed(self, channel_id: str, message_id: str, is_signal: bool):
+        self.supabase.table("processed_messages").upsert(
+            {"channel_id": channel_id, "message_id": message_id, "is_signal": is_signal},
+            on_conflict="channel_id,message_id",
         ).execute()
-        
-        return response
+
+
+def _to_utc_iso(dt) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 ==================================================
 FILE: .\backend\core\schemas.py
 ==================================================
-from pydantic import BaseModel
+import uuid
+from pydantic import BaseModel, Field, field_validator, model_validator, computed_field
 from typing import List, Optional, Literal
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Literal
-from datetime import datetime
+
+def make_signal_id(channel_id: str, message_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{channel_id}_{message_id}"))
+
 
 class Signal(BaseModel):
-    signal_id: str
-    channel_id: str  
-    message_id: str  
+    signal_id: str = Field(default="")
+    channel_id: str
+    message_id: str
     raw_text: str
-    
-    # --- NEW MANDATORY FIELDS ---
     underlying: str
-    instrument_type: str = Field(..., description="Must be EQ, CE, Pe, or FUT")
-    strike: Optional[float] = None
-    # ----------------------------
-    
+    instrument_type: str = Field(..., description="Must be EQ, CE, PE, or FUT")
+    strike: Optional[int] = None
     direction: Literal["BUY", "SELL"]
     entry_price: float
-    targets: List[float] 
+    targets: List[float]
     stop_loss: float
     is_intraday: bool = True
     issued_at: datetime
 
-    # The Fail-Fast Bouncer
-    @field_validator('instrument_type')
+    @model_validator(mode="before")
+    @classmethod
+    def auto_signal_id(cls, values):
+        ch = values.get("channel_id", "")
+        msg = values.get("message_id", "")
+        if ch and msg and not values.get("signal_id"):
+            values["signal_id"] = make_signal_id(ch, msg)
+        return values
+
+    @field_validator("instrument_type", mode="before")
+    @classmethod
     def validate_instrument(cls, v):
         v = v.upper()
-        if v not in ['EQ', 'CE', 'PE', 'FUT']:
-            raise ValueError(f"CRITICAL: Invalid instrument_type '{v}'. Must be EQ, CE,PE, or FUT.")
+        if v not in {"EQ", "CE", "PE", "FUT"}:
+            raise ValueError(f"Invalid instrument_type '{v}'. Must be EQ, CE, PE, or FUT.")
         return v
+
+    @field_validator("entry_price", mode="before")
+    @classmethod
+    def validate_entry_price(cls, v):
+        if float(v) <= 0:
+            raise ValueError(f"entry_price must be > 0, got {v}")
+        return v
+
 
 class OHLC(BaseModel):
     timestamp: datetime
@@ -766,6 +1041,7 @@ class OHLC(BaseModel):
     high: float
     low: float
     close: float
+
 
 class EvaluationResult(BaseModel):
     signal_id: str
@@ -776,312 +1052,163 @@ class EvaluationResult(BaseModel):
     exit_executed_price: Optional[float] = None
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
+    pnl_percentage: float = 0.0
     reason: str
     trace_log: List[str]
-    
-    # NEW: Auditability fields
     engine_version: str = "1.0.0"
-    parser_version: str = "1.0.0"
+
+
+class ChannelAuditResult(BaseModel):
+    channel_name: str
+    channel_id: str
+    total_messages_scraped: int = 0
+    total_trades: int = 0
+    total_wins: int = 0
+    total_losses: int = 0
+    total_squared_off: int = 0
+    total_expired: int = 0
+    win_rate_pct: float = 0.0
+    edge_ratio: float = 0.0
+    avg_mfe: float = 0.0
+    avg_mae: float = 0.0
+
+    @computed_field
+    @property
+    def color_grade(self) -> Literal["green", "red"]:
+        return "green" if self.win_rate_pct > 55.0 and self.edge_ratio > 1.0 else "red"
 
 ==================================================
 FILE: .\backend\core\scraper.py
 ==================================================
 import os
-from datetime import datetime, timezone
+import asyncio
+import logging
+from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError, ChannelPrivateError
 
-API_ID = int(os.environ.get("TG_API_ID"))
-API_HASH = os.environ.get("TG_API_HASH")
+log = logging.getLogger(__name__)
 
-async def scrape_historical_messages(channel_name: str, start_date: datetime):
-    """Connects to Telegram, finds the channel, and pulls messages since start_date."""
-    
-    client = TelegramClient('historical_session', API_ID, API_HASH)
-    await client.connect()
-    
-    if not await client.is_user_authorized():
-        await client.disconnect()
-        raise RuntimeError("Historical Client not authorized. Run auth script for 'historical_session'.")
+_IST = timezone(timedelta(hours=5, minutes=30))
 
-    raw_messages = []
-    try:
-        # 1. Robust Entity Finding (Your trick from run_pipeline)
+
+def _make_client() -> TelegramClient:
+    session = os.environ["TG_SESSION_NAME"]
+    api_id = int(os.environ["TG_API_ID"])
+    api_hash = os.environ["TG_API_HASH"]
+    return TelegramClient(session, api_id, api_hash)
+
+
+async def scrape_historical_messages(channel_input: str, start_date: datetime):
+    """
+    Returns (messages, resolved_channel_id, resolved_channel_name).
+    Each message dict: {message_id, text, time}.
+    """
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=timezone.utc)
+
+    async with _make_client() as client:
+        if not await client.is_user_authorized():
+            raise RuntimeError(
+                "Telegram session expired. Run scripts/telegram_auth.py."
+            )
+
         target_entity = None
-        async for dialog in client.iter_dialogs(limit=150):
-            if dialog.name == channel_name:
-                target_entity = dialog.entity
-                break
-                
+        resolved_id = None
+        resolved_name = None
+        clean = str(channel_input).strip()
+
+        # Fast path: direct resolution
+        try:
+            target_entity = await client.get_entity(clean)
+            resolved_id = str(target_entity.id)
+            resolved_name = getattr(target_entity, "title", clean)
+            log.info("Fast-path resolved: %s (%s)", resolved_name, resolved_id)
+        except ChannelPrivateError:
+            raise
+        except Exception as e:
+            log.warning("Direct entity fetch failed (%s). Falling back to dialogs.", e)
+            no_at = clean.lstrip("@")
+            async for dialog in client.iter_dialogs(limit=50):
+                has_un = hasattr(dialog.entity, "username") and dialog.entity.username
+                if (
+                    str(dialog.id) == no_at
+                    or dialog.name.strip() == clean.strip()
+                    or (has_un and dialog.entity.username.lower() == no_at.lower())
+                ):
+                    target_entity = dialog.entity
+                    resolved_id = str(dialog.id)
+                    resolved_name = dialog.name
+                    break
+
         if not target_entity:
-            print(f"❌ Scraper could not find channel in dialogs: {channel_name}")
-            return []
+            log.error("Could not resolve channel: %s", channel_input)
+            return [], None, None
 
-        # 2. Timezone alignment (Telethon uses UTC)
-        if start_date.tzinfo is None:
-            start_date = start_date.replace(tzinfo=timezone.utc)
+        raw_messages = []
+        attempt = 0
+        while attempt < 2:
+            try:
+                async for message in client.iter_messages(target_entity):
+                    if message.date < start_date:
+                        break
+                    if message.text:
+                        raw_messages.append({
+                            "message_id": str(message.id),
+                            "text": message.text,
+                            "time": message.date.astimezone(_IST),
+                        })
+                break
+            except FloodWaitError as e:
+                wait = e.seconds + 5
+                log.warning("FloodWait: sleeping %ds", wait)
+                await asyncio.sleep(wait)
+                attempt += 1
+                if attempt >= 2:
+                    raise
 
-        # 3. Fetching the data backwards in time
-        async for message in client.iter_messages(target_entity):
-            if message.date < start_date:
-                break # We've gone past the 1-month lookback, stop fetching!
-                
-            if message.text: # Only grab text
-                raw_messages.append({
-                    "text": message.text,
-                    "time": message.date,
-                    "id": str(message.id)
-                })
-                
-        # 4. Reverse the list so the oldest messages are processed first (chronological order)
         raw_messages.reverse()
-        
-    except Exception as e:
-        print(f"Scraping Error: {e}")
-    finally:
-        await client.disconnect()
-        
-    return raw_messages
+        return raw_messages, resolved_id, resolved_name
 
 ==================================================
 FILE: .\backend\core\utils.py
 ==================================================
-SIGNAL_KEYWORDS = [
-    'BUY', 'SELL', 'SL', 'TGT', 'TARGET',
-    'CE', 'PE', 'CALL', 'PUT', 'ABOVE', 'BELOW'
-]
+import re
 
-def is_potential_signal(text: str) -> bool:
-    text_upper = text.upper()
-    return any(keyword in text_upper for keyword in SIGNAL_KEYWORDS)
+_ACTION_KEYWORDS = frozenset({
+    "buy", "sell", "long", "short", "ce", "pe", "call", "put",
+    "btst", "stbt", "buy above", "sell below", "add more", "avg",
+    "eq", "cash", "spot"
+})
+
+_INDEX_KEYWORDS = frozenset({
+    "nifty", "banknifty", "finnifty", "sensex", "midcpnifty", "bankex",
+    "crude", "crudeoil", "gold", "silver", "naturalgas"
+})
+
+_PARAM_KEYWORDS = frozenset({
+    "sl", "stop", "stoploss", "stop loss", "tgt", "target", "cmp",
+    "entry", "above", "below", "tp", "take profit", "slm",
+    "book", "trail", "safe", "exit", "b/o", "breakout"
+})
+
+
+def is_potential_trade(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    if not re.search(r'\d', t):
+        return False
+    if any(kw in t for kw in _ACTION_KEYWORDS | _INDEX_KEYWORDS):
+        return True
+    if any(kw in t for kw in _PARAM_KEYWORDS):
+        return True
+    return False
 
 ==================================================
 FILE: .\backend\core\__init__.py
 ==================================================
 
-
-==================================================
-FILE: .\backend\scripts\analyze_results.py
-==================================================
-import os
-import sys
-import pandas as pd
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.repository import SupabaseRepository
-
-def analyze_channel():
-    print("📊 FETCHING ALGORITHMIC REPORT CARD...\n")
-    repo = SupabaseRepository()
-    
-    # Fetch all evaluations
-    response = repo.supabase.table('evaluations').select('*').execute()
-    data = response.data
-    
-    if not data:
-        print("❌ No evaluation data found.")
-        return
-        
-    df = pd.DataFrame(data)
-    
-    # Filter to only look at trades that actually triggered (Ignore EXPIRED)
-    df_active = df[df['status'] != 'EXPIRED'].copy()
-    
-    if df_active.empty:
-        print("No active trades found to analyze.")
-        return
-
-    total_trades = len(df_active)
-    
-    # MFE is points gained. MAE is points lost. 
-    avg_mfe = df_active['max_favorable_excursion'].mean()
-    avg_mae = df_active['max_adverse_excursion'].mean()
-    
-    # Excursion Ratio: If this is under 1.0, the market goes against them harder than it goes for them.
-    # To prevent division by zero, we use a tiny offset if MAE is exactly 0
-    safe_mae = abs(avg_mae) if abs(avg_mae) > 0 else 0.01
-    excursion_ratio = avg_mfe / safe_mae
-
-    print("=================================================")
-    print("📈 KATTALAN CHANNEL ANALYSIS REPORT")
-    print("=================================================")
-    print(f"Total Triggered Trades : {total_trades}")
-    print(f"Average Max Favorable  : +{avg_mfe:.2f} points per trade (The Reward)")
-    print(f"Average Max Adverse    : {avg_mae:.2f} points per trade (The Risk)")
-    print("-------------------------------------------------")
-    
-    print(f"DIRECTIONAL EDGE RATIO : {excursion_ratio:.2f}")
-    
-    if excursion_ratio > 1.5:
-        print("🟢 VERDICT: EXCELLENT EDGE. This channel accurately predicts massive breakouts.")
-    elif excursion_ratio > 1.0:
-        print("🟡 VERDICT: MODERATE EDGE. They pick the right direction, but risk/reward is tight.")
-    else:
-        print("🔴 VERDICT: FRAUD/GUESSING. The market moves against them more than it moves for them.")
-    print("=================================================")
-
-if __name__ == "__main__":
-    analyze_channel()
-
-==================================================
-FILE: .\backend\scripts\evaluate_db.py
-==================================================
-import os
-import sys
-import pytz
-from datetime import datetime
-
-# Point to your core modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from core.repository import SupabaseRepository
-from data.provider_fyers import FyersDataProvider
-from core.quant_engine import QuantEngine
-from core.schemas import Signal
-
-def build_fyers_symbol(underlying: str, instr_type: str) -> str:
-    """Converts the Telegram asset name into a valid Fyers ticker."""
-    underlying = underlying.upper().strip()
-    
-    # Map the exact Index names Fyers expects
-    if "BANK" in underlying:
-        return "NSE:NIFTYBANK-INDEX"
-    elif "NIFTY" in underlying:
-        return "NSE:NIFTY50-INDEX"
-    elif "SENSEX" in underlying:
-        return "BSE:SENSEX-INDEX"
-    
-    # Standard equity stocks (like ONGC, ABB, NTPC)
-    return f"NSE:{underlying}-EQ"
-
-def run_evaluation():
-    print("🚀 BOOTING KATTALAN BACKTESTER...\n")
-    
-    repo = SupabaseRepository()
-    provider = FyersDataProvider()
-    engine = QuantEngine()
-    ist = pytz.timezone('Asia/Kolkata')
-
-    print("📥 Fetching trades from Supabase `signals` table...")
-    # Get up to 50 recent trades from your database
-    response = repo.supabase.table('signals').select('*').order('issued_at', desc=True).limit(50).execute()
-    
-    if not response.data:
-        print("❌ No trades found in database.")
-        return
-
-    success_count = 0
-
-    for row in response.data:
-        try:
-            # 1. Rebuild the Signal object from the Supabase row
-            issued_at = datetime.fromisoformat(row['issued_at'])
-            
-            signal = Signal(
-                signal_id=row['signal_id'],
-                channel_id=row['channel_id'],
-                message_id=row['message_id'],
-                raw_text=row['raw_text'],
-                underlying=row.get('underlying', 'UNKNOWN'),
-                instrument_type=row.get('instrument_type', 'EQ'),
-                strike=row.get('strike'),
-                direction=row['direction'],
-                entry_price=row['entry_price'],
-                stop_loss=row['stop_loss'],
-                targets=row['targets'],
-                is_intraday=row['is_intraday'],
-                issued_at=issued_at
-            )
-
-            symbol = build_fyers_symbol(signal.underlying, signal.instrument_type)
-            print(f"\n⚙️ Evaluating {signal.direction} {symbol} (from {issued_at.strftime('%Y-%m-%d')})")
-
-            # 2. Define the exact market window (Time of Telegram post -> 15:30)
-            start_time = issued_at.astimezone(ist) if issued_at.tzinfo else ist.localize(issued_at)
-            end_time = start_time.replace(hour=15, minute=30, second=0)
-
-            # 3. Ask Fyers for the exact 1-minute chart for that window
-            market_data = provider.fetch_1m_data(symbol, start_time, end_time)
-            
-            if not market_data:
-                print(f"  ⏭️ Skipped: No Fyers data found (Holiday, Weekend, or market closed).")
-                continue
-
-            # 4. Run the math
-            evaluation = engine.evaluate(signal, market_data)
-
-            # 5. Save the WIN/LOSS result to the Supabase `evaluations` table
-            repo.upsert_evaluation(evaluation)
-            print(f"  ✅ SAVED EVALUATION: {evaluation.status} | Exit Price: {evaluation.exit_executed_price}")
-            success_count += 1
-
-        except Exception as e:
-            print(f"  ❌ Execution Error: {e}")
-
-    print("\n=================================================")
-    print(f"🎉 BACKTEST COMPLETE! Calculated Win/Loss for {success_count} trades.")
-    print("=================================================")
-
-if __name__ == "__main__":
-    run_evaluation()
-
-==================================================
-FILE: .\backend\scripts\fetch_signals.py
-==================================================
-import os
-import sys
-from telethon.sync import TelegramClient
-from dotenv import load_dotenv
-
-load_dotenv()
-
-API_ID = os.environ.get("TG_API_ID")
-API_HASH = os.environ.get("TG_API_HASH")
-
-TARGET_CHAT_NAME = "Trade With Logic (Index + Stock)" 
-
-# Our "Bouncer" keywords. If a message doesn't have at least one of these, it's spam.
-SIGNAL_KEYWORDS = ['BUY', 'SELL', 'SL', 'TGT', 'TARGET', 'CE', 'PE', 'CALL', 'PUT', 'ABOVE', 'BELOW']
-
-def is_potential_signal(text: str) -> bool:
-    text_upper = text.upper()
-    # Check if any of our keywords exist in the message
-    return any(keyword in text_upper for keyword in SIGNAL_KEYWORDS)
-
-with TelegramClient('kattalan_session', int(API_ID), API_HASH) as client:
-    print(f"🔍 Locating '{TARGET_CHAT_NAME}'...")
-    
-    target_entity = None
-    for dialog in client.get_dialogs(limit=50):
-        if dialog.name == TARGET_CHAT_NAME:
-            target_entity = dialog.entity
-            break
-            
-    if not target_entity:
-        print("❌ Could not find channel.")
-        sys.exit()
-        
-    print(f"✅ Connected! Fetching last 100 messages to hunt for real signals...\n")
-    
-    messages = client.get_messages(target_entity, limit=100)
-    
-    signal_count = 0
-    spam_count = 0
-    
-    for msg in messages:
-        if msg.text:
-            if is_potential_signal(msg.text):
-                signal_count += 1
-                print("-------------------------------------------------")
-                print(f"🟢 POTENTIAL SIGNAL DETECTED (ID: {msg.id})")
-                print(f"Text:\n{msg.text.strip()}")
-            else:
-                spam_count += 1
-
-    print("\n=================================================")
-    print(f"📊 REPORT: Scanned 100 messages.")
-    print(f"🗑️ Spam/Marketing dropped: {spam_count}")
-    print(f"🎯 Real Signals found: {signal_count}")
-    print("=================================================")
 
 ==================================================
 FILE: .\backend\scripts\fyers_auth.py
@@ -1169,273 +1296,6 @@ with TelegramClient('kattalan_session', int(API_ID), API_HASH) as client:
         print(f"ID: {dialog.id} | Name: {dialog.name}")
 
 ==================================================
-FILE: .\backend\scripts\live_listener.py
-==================================================
-import os
-import requests
-from telethon import TelegramClient, events
-from dotenv import load_dotenv
-
-load_dotenv()
-
-API_ID = os.environ.get("TG_API_ID")
-API_HASH = os.environ.get("TG_API_HASH")
-TARGET_CHAT_NAME = "Trade With Logic (Index + Stock)" 
-WEBHOOK_URL = "http://127.0.0.1:8000/webhook/telegram"
-
-# Connect using the session we already created
-client = TelegramClient('kattalan_session', int(API_ID), API_HASH)
-
-def forward_to_engine(message_obj, is_edit=False):
-    """Packages the Telegram event and fires it to our local FastAPI server."""
-    payload = {
-        "message": {
-            "message_id": message_obj.id,
-            "date": int(message_obj.date.timestamp()),
-            "chat": {"id": str(message_obj.chat_id)},
-            "text": message_obj.text
-        }
-    }
-    
-    # If it's an edit, tweak the JSON key so main.py knows
-    if is_edit:
-        payload["edited_message"] = payload.pop("message")
-
-    try:
-        response = requests.post(WEBHOOK_URL, json=payload)
-        if response.status_code == 200:
-            print(f"  ✅ Engine Processed. Response: {response.json().get('status')}")
-        else:
-            print(f"  ⚠️ Engine Error: {response.status_code} - {response.text}")
-    except requests.exceptions.ConnectionError:
-        print("  ❌ FATAL: Could not reach FastAPI server. Is uvicorn running?")
-
-# --- 1. CATCH NEW MESSAGES INSTANTLY ---
-@client.on(events.NewMessage(chats=TARGET_CHAT_NAME))
-async def handle_new_message(event):
-    if not event.message.text: return
-    print(f"\n🚨 NEW MESSAGE CAUGHT: {event.message.text[:50]}...")
-    forward_to_engine(event.message)
-
-# --- 2. CATCH SCAMMERS CHANGING TARGETS MID-TRADE ---
-@client.on(events.MessageEdited(chats=TARGET_CHAT_NAME))
-async def handle_edit(event):
-    if not event.message.text: return
-    print(f"\n⚠️ MESSAGE EDITED CAUGHT: {event.message.text[:50]}...")
-    forward_to_engine(event.message, is_edit=True)
-
-# --- 3. CATCH SCAMMERS DELETING LOSSES ---
-@client.on(events.MessageDeleted(chats=TARGET_CHAT_NAME))
-async def handle_delete(event):
-    # event.deleted_ids contains the message IDs they just tried to wipe
-    print(f"\n🗑️ DELETE DETECTED! They tried to hide Message IDs: {event.deleted_ids}")
-
-print("🎧 KATTALAN LIVE LISTENER ACTIVE. Waiting for signals...")
-client.start()
-client.run_until_disconnected()
-
-==================================================
-FILE: .\backend\scripts\run_pipeline.py
-==================================================
-import os
-import sys
-import time
-from datetime import datetime, timedelta, timezone
-from telethon.sync import TelegramClient
-from dotenv import load_dotenv
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from core.parser import SignalParser
-from core.repository import SupabaseRepository
-from core.utils import is_potential_signal
-
-load_dotenv()
-
-API_ID = os.environ.get("TG_API_ID")
-API_HASH = os.environ.get("TG_API_HASH")
-TARGET_CHAT_NAME = "Trade With Logic (Index + Stock)" 
-CHANNEL_DB_ID = "Trade_With_Logic" # Used to identify the channel in Supabase
-BATCH_SIZE = 100
-
-def chunk_list(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-def run():
-    print("🚀 BOOTING RESUMABLE INGESTION PIPELINE...\n")
-    parser = SignalParser()
-    repo = SupabaseRepository()
-    
-    # --- 1. THE CHECKPOINT: Ask DB what we already have ---
-    print("🗄️ Checking database for previously parsed messages...")
-    try:
-        # Fetch only the message_ids to save bandwidth
-        existing_records = repo.supabase.table('signals').select('message_id').eq('channel_id', CHANNEL_DB_ID).execute()
-        existing_ids = {str(row['message_id']) for row in existing_records.data}
-        print(f"✅ Found {len(existing_ids)} trades already secured in Supabase. These will be skipped.")
-    except Exception as e:
-        print(f"❌ Failed to connect to Supabase: {e}")
-        return
-
-    with TelegramClient('kattalan_session', int(API_ID), API_HASH) as client:
-        target_entity = None
-        for dialog in client.get_dialogs(limit=150):
-            if dialog.name == TARGET_CHAT_NAME:
-                target_entity = dialog.entity
-                break
-                
-        if not target_entity:
-            print("❌ Could not find channel.")
-            return
-
-        # --- 2. THE TIME MACHINE: Exactly 6 Months ---
-        six_months_ago = datetime.now(timezone.utc) - timedelta(days=180)
-        print(f"\n📥 Fetching Telegram history back to {six_months_ago.strftime('%Y-%m-%d')}...")
-        
-        filtered_messages = []
-        
-        for msg in client.iter_messages(target_entity):
-            # Stop downloading if we pass the 6-month mark
-            if msg.date < six_months_ago:
-                break 
-                
-            msg_id_str = str(msg.id)
-            
-            # Skip if we already parsed this exact message in a previous run
-            if msg_id_str in existing_ids:
-                continue
-
-            # Run the strict Python Regex Bouncer (Costs $0)
-            if msg.text and is_potential_signal(msg.text):
-                filtered_messages.append({"message_id": msg_id_str, "text": msg.text, "time": msg.date})
-
-        if not filtered_messages:
-            print("\n🎉 Pipeline is 100% up to date! No new signals to process.")
-            return
-
-        print(f"📦 Found {len(filtered_messages)} NEW potential signals. Sending to AI in batches of {BATCH_SIZE}...\n")
-        
-        saved_count = 0
-        batches = list(chunk_list(filtered_messages, BATCH_SIZE))
-        
-        for index, batch in enumerate(batches):
-            print(f"⚙️ Processing Batch {index + 1}/{len(batches)}...")
-            
-            try:
-                parsed_results = parser.parse_batch(batch_data=batch, channel_id=CHANNEL_DB_ID)
-                
-                for result in parsed_results:
-                    signal = result['signal']
-                    instr = result['instrument_data']
-                    try:
-                        repo.upsert_signal(signal)
-                        print(f"  ✅ SAVED TO DATABASE: {instr.underlying} {instr.strike} {instr.instrument_type}")
-                        saved_count += 1
-                    except Exception as e:
-                        print(f"  ❌ DB Error: {e}")
-
-            except Exception as e:
-                error_str = str(e).lower()
-                # --- 3. THE GRACEFUL CRASH (Rate Limit & Auth Handling) ---
-                critical_errors = ["429", "quota", "exhausted", "403", "permission_denied", "leaked", "api key"]
-                
-                if any(keyword in error_str for keyword in critical_errors):
-                    print(f"\n🛑 CRITICAL AI ERROR HIT: {e}")
-                    print("--> ACTION REQUIRED: Pipeline paused to save resources.")
-                    print("    1. Generate a brand new GEMINI_API_KEY and update your .env file.")
-                    print("    2. Run this script again. It will safely resume exactly where it stopped.")
-                    sys.exit(0) # Immediately terminates the entire script
-                else:
-                    print(f"❌ Batch Error: {e}")
-            
-            # Sleep to prevent spamming the API too fast
-            if index < len(batches) - 1:
-                print("⏳ Sleeping 12 seconds for rate limits...")
-                time.sleep(12)
-                
-        print(f"\n🎉 COMPLETE! Added {saved_count} new historical trades to the database.")
-
-if __name__ == "__main__":
-    run()
-
-==================================================
-FILE: .\backend\scripts\seed_db.py
-==================================================
-import sys
-import os
-from datetime import datetime, timedelta
-import pytz
-
-# Adjust path to import from core/
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from core.parser import SignalParser
-from core.quant_engine import QuantEngine
-from core.repository import SupabaseRepository
-from data.provider_fyers import FyersDataProvider
-
-def run_production_seed():
-    print("🚀 STARTING KATTALAN PRODUCTION SEED...")
-    ist = pytz.timezone('Asia/Kolkata')
-    
-    # 1. Init Components
-    parser = SignalParser()
-    engine = QuantEngine()
-    db = SupabaseRepository()
-    provider = FyersDataProvider()
-
-    # 2. REAL TEST BATCH (Replace these with 5-10 actual messages from your Telegram channels)
-    # Ensure the dates are within the last few days so Fyers has 1m data!
-    raw_batch = [
-        {
-            "channel": "PRO_TRADERS_INDIA",
-            "msg_id": "MSG_999",
-            "time": datetime(2026, 3, 4, 10, 15), # Yesterday
-            "text": "BANKNIFTY 48200 CE BUY ABOVE 420 SL 380 TGT 460 500"
-        },
-        # Add more real messages here...
-    ]
-
-    for item in raw_batch:
-        try:
-            print(f"\n📦 Processing {item['msg_id']}...")
-            
-            # STEP A: AI EXTRACTION
-            parsed_data = parser.parse(
-                raw_text=item["text"],
-                message_time=item["time"],
-                channel_id=item["channel"],
-                message_id=item["msg_id"]
-            )
-            signal = parsed_data["signal"]
-            instr = parsed_data["instrument_data"]
-
-            # STEP B: TICKER CONSTRUCTION
-            # For Phase B, we use the Index Spot for math to ensure 100% data availability
-            ticker = "NSE:BANKNIFTY-INDEX" if "BANK" in instr.underlying else "NSE:NIFTY50-INDEX"
-            
-            # STEP C: FETCH DATA
-            start_time = ist.localize(item["time"])
-            end_time = start_time.replace(hour=15, minute=30)
-            market_data = provider.fetch_1m_data(ticker, start_time, end_time)
-
-            # STEP D: EVALUATE
-            result = engine.evaluate(signal, market_data)
-
-            # STEP E: CLOUD PUSH
-            db.upsert_signal(signal)
-            db.upsert_evaluation(result)
-            
-            print(f"✅ SUCCESS: {item['msg_id']} | Status: {result.status} | Exit: {result.exit_executed_price}")
-
-        except Exception as e:
-            print(f"❌ FAILED {item['msg_id']}: {e}")
-
-if __name__ == "__main__":
-    run_production_seed()
-
-==================================================
 FILE: .\backend\scripts\telegram_auth.py
 ==================================================
 import os
@@ -1458,144 +1318,6 @@ with TelegramClient('kattalan_session', int(API_ID), API_HASH) as client:
     # Let's prove it works by grabbing your last saved message
     for msg in client.get_messages('me', limit=1):
         print(f"Your last saved message: {msg.text}")
-
-==================================================
-FILE: .\backend\scripts\test_webhook.py
-==================================================
-import requests
-import time
-
-# This is the exact JSON shape Telegram sends to a webhook
-mock_telegram_payload = {
-    "message": {
-        "message_id": 9999,
-        "date": int(time.time()),
-        "chat": {
-            "id": "-1001234567890",
-            "title": "Trade With Logic"
-        },
-        "text": "BUY BANKNIFTY 48000 CE ABOVE 400 SL 350 TGT 450 500"
-    }
-}
-
-print("🔫 Firing mock Telegram payload at local server...")
-try:
-    # Target your local FastAPI webhook endpoint
-    response = requests.post("http://127.0.0.1:8000/webhook/telegram", json=mock_telegram_payload)
-    print(f"Status Code: {response.status_code}")
-    print(f"Response: {response.json()}")
-except requests.exceptions.ConnectionError:
-    print("❌ SERVER OFFLINE: You need to start your FastAPI server first.")
-
-==================================================
-FILE: .\backend\scripts\test_ws.py
-==================================================
-import asyncio
-import websockets
-import json
-
-async def test_audit():
-    uri = "ws://127.0.0.1:8000/api/ws/audit"
-    
-    # We are pretending to be your Svelte frontend here
-    payload = {
-        "channel_name": "Trade With Logic (Index + Stock)", 
-        "timeframe": "1_month"
-    }
-
-    async with websockets.connect(uri) as websocket:
-        print("🔗 Connected to Kattalan Engine WebSocket...")
-        
-        # 1. Send the trigger
-        await websocket.send(json.dumps(payload))
-        
-        # 2. Listen to the live stream
-        try:
-            while True:
-                response = await websocket.recv()
-                data = json.loads(response)
-                
-                print(f"[{data.get('progress')}%] {data.get('status')}")
-                
-                # If we get the final results payload, the audit is done
-                if "results" in data:
-                    print("\n✅ FINAL AUDIT RESULTS:")
-                    print(json.dumps(data["results"], indent=2))
-                    break
-                    
-        except websockets.exceptions.ConnectionClosed:
-            print("WebSocket closed by server.")
-
-if __name__ == "__main__":
-    asyncio.run(test_audit())
-
-==================================================
-FILE: .\backend\scripts\verify_engine.py
-==================================================
-import sys
-import os
-from datetime import datetime
-import pytz
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from core.parser import SignalParser
-from core.quant_engine import QuantEngine
-from data.provider_fyers import FyersDataProvider
-
-def verify_trades():
-    print("🔍 KATTALAN ENGINE AUDIT: VERIFYING REAL TELEGRAM DATA")
-    ist = pytz.timezone('Asia/Kolkata')
-    
-    parser = SignalParser()
-    engine = QuantEngine()
-    provider = FyersDataProvider()
-
-    test_batch = [
-        {
-            "id": "EQUITY_VERIFY_003",
-            "time": datetime(2026, 3, 4, 9, 20), 
-            "text": "BUY HDFCBANK ABOVE 865 SL 855 TGT 875", # Entry is now above the open price
-            "symbol": "NSE:HDFCBANK-EQ" 
-        }
-    ]
-
-    for item in test_batch:
-        try:
-            print(f"\n--- Testing {item['id']} ---")
-            
-            res = parser.parse(item['text'], item['time'], "AUDIT", item['id'])
-            signal = res['signal']
-            
-            start_time = ist.localize(item['time'])
-            end_time = start_time.replace(hour=15, minute=30)
-            market_data = provider.fetch_1m_data(item['symbol'], start_time, end_time)
-            
-            if not market_data:
-                print("❌ No market data returned from Fyers.")
-                continue
-
-            print(f"📊 First candle price: {market_data[0].open} | Signal Entry: {signal.entry_price}")
-            
-            eval_result = engine.evaluate(signal, market_data)
-            
-            # FIX: Using .status and .reason (matching our QuantEngine schema)
-            print(f"RESULT: {eval_result.status}")
-            print(f"EXIT PRICE: {eval_result.exit_executed_price}")
-            print(f"EXIT TIME: {eval_result.exit_time}")
-            print(f"REASON: {getattr(eval_result, 'reason', 'No reason provided')}")
-            
-            print("\nTRACE LOG (Top 5):")
-            for log in eval_result.trace_log[:5]:
-                print(f"  - {log}")
-
-        except Exception as e:
-            print(f"❌ Verification Failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-if __name__ == "__main__":
-    verify_trades()
 
 ==================================================
 FILE: .\backend\tests\test_engine.py
@@ -1699,113 +1421,126 @@ def test_intraday_auto_square_off(engine):
 FILE: .\backend\tests\test_orchestrator.py
 ==================================================
 import pytest
-import os
-import pandas as pd
-from datetime import datetime
-from core.orchestrator import KattalanOrchestrator
-from data.provider_csv import CSVMarketDataProvider
+from datetime import datetime, timezone
+from core.schemas import Signal, OHLC
+from core.quant_engine import QuantEngine
+
+
+def ts(h, m):
+    """Timezone-aware timestamp for tests."""
+    return datetime(2023, 1, 2, h, m, tzinfo=timezone.utc)
+
+
+def make_signal(**kwargs):
+    defaults = dict(
+        channel_id="TEST_CH",
+        message_id="TEST_MSG",
+        raw_text="mock signal",
+        underlying="BANKNIFTY",
+        instrument_type="EQ",
+        direction="BUY",
+        entry_price=100.0,
+        targets=[110.0],
+        stop_loss=90.0,
+        is_intraday=True,
+        issued_at=ts(9, 15),
+    )
+    defaults.update(kwargs)
+    return Signal(**defaults)
+
 
 @pytest.fixture
-def mock_csv_path():
-    path = "tests/temp_orchestrator_data.csv"
-    data = {
-        "timestamp": [
-            "2023-01-01 10:00:00", 
-            "2023-01-01 10:01:00", 
-            "2023-01-01 10:02:00",
-            "2023-01-01 10:03:00" 
-        ],
-        "symbol": ["NSE:NIFTYBANK-INDEX", "NSE:NIFTYBANK-INDEX", "NSE:NIFTYBANK-INDEX", "NSE:NIFTYBANK-INDEX"],
-        "open": [48000.0, 48010.0, 48050.0, 48100.0],
-        "high": [48020.0, 48060.0, 48110.0, 48210.0], 
-        "low": [47990.0, 48000.0, 48040.0, 48090.0],
-        "close": [48010.0, 48050.0, 48100.0, 48200.0]
-    }
-    pd.DataFrame(data).to_csv(path, index=False)
-    yield path
-    if os.path.exists(path):
-        os.remove(path)
+def engine():
+    return QuantEngine()
 
-def test_full_pipeline_success(mock_csv_path):
-    provider = CSVMarketDataProvider(mock_csv_path)
-    orchestrator = KattalanOrchestrator(provider)
-    
-    raw_telegram_message = "🚀 BUY BANKNIFTY ABOVE 48000... SL: 47900 TGT 48100, 48200"
-    message_time = datetime(2023, 1, 1, 9, 59, 0) 
-    
-    # Passing the required mock IDs
-    result = orchestrator.process_live_message(
-        raw_text=raw_telegram_message, 
-        message_time=message_time, 
-        channel_id="TEST_CH",
-        message_id="TEST_MSG"
+
+def test_wick_conflict_evaluates_to_loss(engine):
+    signal = make_signal(entry_price=100.0, targets=[110.0], stop_loss=90.0)
+    market_data = [
+        OHLC(timestamp=ts(9, 16), open=95.0, high=99.0, low=92.0, close=98.0),
+        OHLC(timestamp=ts(9, 17), open=98.0, high=102.0, low=98.0, close=101.0),
+        OHLC(timestamp=ts(9, 18), open=101.0, high=112.0, low=88.0, close=105.0),
+    ]
+    result = engine.evaluate(signal, market_data)
+    assert result.status == "LOSS"
+    assert result.exit_executed_price == 90.0
+    assert "WICK CONFLICT" in result.reason
+
+
+def test_multi_target_trailing_sl(engine):
+    signal = make_signal(entry_price=100.0, targets=[110.0, 120.0], stop_loss=90.0)
+    market_data = [
+        OHLC(timestamp=ts(10, 1), open=99.0, high=101.0, low=99.0, close=100.5),
+        OHLC(timestamp=ts(10, 2), open=100.5, high=111.0, low=100.0, close=109.0),
+        OHLC(timestamp=ts(10, 3), open=109.0, high=110.0, low=95.0, close=96.0),
+    ]
+    result = engine.evaluate(signal, market_data)
+    assert result.status == "WIN"
+    assert result.exit_executed_price == 100.0
+    assert "STOP LOSS HIT" in result.reason
+
+
+def test_intraday_auto_square_off(engine):
+    signal = make_signal(direction="SELL", entry_price=200.0, targets=[180.0], stop_loss=210.0)
+    market_data = [
+        OHLC(timestamp=ts(14, 5), open=202.0, high=202.0, low=199.0, close=200.0),
+        OHLC(timestamp=ts(15, 14), open=195.0, high=196.0, low=194.0, close=195.0),
+        OHLC(timestamp=ts(15, 15), open=195.0, high=195.0, low=192.0, close=193.0),
+    ]
+    result = engine.evaluate(signal, market_data)
+    assert result.status == "SQUARED_OFF"
+    assert result.exit_executed_price == 193.0
+
+
+def test_entry_never_triggered_returns_expired(engine):
+    """Req: if entry price never touched, status = EXPIRED."""
+    signal = make_signal(entry_price=200.0, targets=[210.0], stop_loss=190.0)
+    market_data = [
+        OHLC(timestamp=ts(9, 16), open=100.0, high=110.0, low=99.0, close=105.0),
+        OHLC(timestamp=ts(9, 17), open=105.0, high=115.0, low=104.0, close=110.0),
+    ]
+    result = engine.evaluate(signal, market_data)
+    assert result.status == "EXPIRED"
+    assert result.entry_executed_price is None
+    assert result.pnl_percentage == 0.0
+
+
+def test_option_mfe_tracking(engine):
+    """Req: CE options enter immediately and track directional MFE/MAE on spot."""
+    signal = make_signal(
+        instrument_type="CE",
+        direction="BUY",
+        entry_price=48000.0,
+        targets=[48200.0],
+        stop_loss=47800.0,
     )
-    
+    market_data = [
+        OHLC(timestamp=ts(10, 0), open=48000.0, high=48150.0, low=47950.0, close=48100.0),
+        OHLC(timestamp=ts(10, 1), open=48100.0, high=48300.0, low=48050.0, close=48250.0),
+    ]
+    result = engine.evaluate(signal, market_data)
+    # Entry at 48000 open, T1=48200 hit in candle 2 high=48300
     assert result.status == "WIN"
     assert result.entry_executed_price == 48000.0
-    assert result.exit_executed_price == 48200.0
+    assert result.max_favorable_excursion >= 200.0  # at least 48200-48000
+    assert result.max_adverse_excursion >= 0.0
 
-==================================================
-FILE: .\backend\tests\test_parser.py
-==================================================
-import pytest
-from datetime import datetime
-from core.parser import SignalParser
 
-@pytest.fixture
-def parser():
-    return SignalParser()
+def test_empty_market_data_returns_expired(engine):
+    signal = make_signal()
+    result = engine.evaluate(signal, [])
+    assert result.status == "EXPIRED"
 
-def test_standard_buy_call(parser):
-    raw_text = "🚀 BUY BANKNIFTY 48000 CE @ 500 \nSL 450 \nTGT 550 600 650 🔥"
-    result = parser.parse(raw_text, datetime(2023, 1, 1, 10, 0), channel_id="TEST_CH", message_id="TEST_MSG")
-    
-    signal = result["signal"] # <-- FIXED: Extract from dictionary
-    
-    assert signal.direction == "BUY"
-    assert signal.entry_price == 500.0
-    assert signal.stop_loss == 450.0
-    assert signal.targets == [550.0, 600.0, 650.0]
-    assert signal.channel_id == "TEST_CH"
-    assert signal.message_id == "TEST_MSG"
 
-def test_messy_sell_call(parser):
-    raw_text = "SELL NIFTY FUT BELOW 21000... STOPLOSS: 21100 TARGETS 20900, 20850"
-    result = parser.parse(raw_text, datetime(2023, 1, 1, 10, 0), channel_id="TEST_CH", message_id="TEST_MSG")
-    
-    signal = result["signal"] # <-- FIXED: Extract from dictionary
-    
-    assert signal.direction == "SELL"
-    assert signal.entry_price == 21000.0
-    assert signal.stop_loss == 21100.0
-    assert signal.targets == [20900.0, 20850.0] 
-
-def test_parser_fails_safely_on_junk(parser):
-    raw_text = "Good morning traders! Market looks bullish today."
-    
-    with pytest.raises(ValueError) as excinfo:
-        parser.parse(raw_text, datetime(2023, 1, 1, 10, 0), channel_id="TEST_CH", message_id="TEST_MSG")
-        
-    assert "LLM Parsing failed" in str(excinfo.value) # <-- FIXED: Match new error string
-    
-import pytest
-from datetime import datetime
-from unittest.mock import patch # <-- ADD THIS IMPORT AT THE TOP
-from core.parser import SignalParser
-
-# ... (keep your fixture and first two tests exactly as they are) ...
-
-@patch('core.parser.genai.Client') # Mocks the Gemini Client
-def test_parser_fails_safely_on_junk(mock_client, parser):
-    raw_text = "Good morning traders! Market looks bullish today."
-    
-    # Force the mock client to simulate an API crash/refusal
-    mock_client.return_value.models.generate_content.side_effect = Exception("API Offline")
-    
-    with pytest.raises(ValueError) as excinfo:
-        parser.parse(raw_text, datetime(2023, 1, 1, 10, 0), channel_id="TEST_CH", message_id="TEST_MSG")
-        
-    assert "LLM Parsing failed" in str(excinfo.value)
+def test_sell_signal_win(engine):
+    signal = make_signal(direction="SELL", entry_price=200.0, targets=[190.0], stop_loss=205.0)
+    market_data = [
+        OHLC(timestamp=ts(9, 16), open=201.0, high=202.0, low=199.0, close=200.0),
+        OHLC(timestamp=ts(9, 17), open=200.0, high=200.0, low=188.0, close=190.0),
+    ]
+    result = engine.evaluate(signal, market_data)
+    assert result.status == "WIN"
+    assert result.pnl_percentage > 0
 
 ==================================================
 FILE: .\backend\tests\test_provider.py
@@ -2114,178 +1849,177 @@ FILE: .\frontend\src\routes\+page.svelte
 ==================================================
 <script>
   import '../app.css';
+  import { onMount } from 'svelte';
 
-  // ─── State ───────────────────────────────────────────────────────────────────
-  let channelName = '';
+  let channelInput = '';
   let timeframe = '1_month';
-
-  // Possible phases: 'idle' | 'loading' | 'complete' | 'error'
-  let phase = 'idle';
-
+  let phase = 'idle'; // idle | loading | complete | error
   let progress = 0;
   let statusText = '';
-  let results = null;  // { channel, total_trades, win_rate, edge_ratio, color_grade }
+  let results = null;
 
-  // ─── WebSocket Logic ─────────────────────────────────────────────────────────
-  function startAudit() {
-    if (!channelName.trim()) return;
+  // Memoized ticker bar — generated once on mount, not on every reactive update
+  let tickers = [];
+  onMount(() => {
+    tickers = ['NSE', 'BSE', 'NIFTY50', 'BANKNIFTY', 'GOLD', 'SENSEX', 'USDINR'].map(sym => ({
+      sym,
+      pct: (Math.random() * 5 + 0.1).toFixed(2),
+    }));
+  });
 
-    // Reset
-    phase = 'loading';
-    progress = 0;
-    statusText = 'Initialising connection...';
-    results = null;
-
-    const ws = new WebSocket('ws://127.0.0.1:8000/api/ws/audit');
-
-    ws.onopen = () => {
-      ws.send(JSON.stringify({
-        channel_name: channelName.trim(),
-        timeframe: timeframe
-      }));
-    };
-
-    ws.onmessage = (event) => {
-      const payload = JSON.parse(event.data);
-
-      progress = payload.progress ?? progress;
-      statusText = payload.status ?? statusText;
-
-      if (payload.progress === 100 && payload.results) {
-        results = payload.results;
-        phase = 'complete';
-        ws.close();
-      } else if (payload.status && payload.status.startsWith('FATAL ERROR')) {
-        phase = 'error';
-        ws.close();
-      }
-    };
-
-    ws.onerror = () => {
-      statusText = 'WebSocket error — is the backend running?';
-      phase = 'error';
-    };
-
-    ws.onclose = () => {
-      if (phase === 'loading') {
-        phase = 'error';
-        statusText = 'Connection closed unexpectedly.';
-      }
-    };
-  }
-
-  // ─── Helpers ─────────────────────────────────────────────────────────────────
   const timeframeOptions = [
     { value: '1_month',  label: '1 Month'  },
     { value: '3_months', label: '3 Months' },
     { value: '6_months', label: '6 Months' },
   ];
 
-  $: gradeIsGreen  = results?.color_grade === 'green';
-  $: cardClass     = gradeIsGreen ? 'card-green' : 'card-red';
-  $: gradeAccent   = gradeIsGreen ? 'text-green-400' : 'text-red-400';
-  $: gradeBg       = gradeIsGreen ? 'from-green-500/10 to-transparent' : 'from-red-500/10 to-transparent';
-  $: borderColor   = gradeIsGreen ? 'rgba(34,197,94,0.7)' : 'rgba(239,68,68,0.7)';
+  let _ws = null;
+  let _timeoutHandle = null;
+  let showSkip = false;
+
+  function startAudit() {
+    if (!channelInput.trim()) return;
+    phase = 'loading';
+    progress = 0;
+    statusText = 'Initialising connection...';
+    results = null;
+    showSkip = false;
+
+    _ws = new WebSocket('ws://127.0.0.1:8000/api/ws/audit');
+
+    _ws.onopen = () => {
+      _ws.send(JSON.stringify({ channel_input: channelInput.trim(), timeframe }));
+      _resetTimeout();
+    };
+
+    _ws.onmessage = (event) => {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (err) {
+        console.error('Malformed JSON from backend:', event.data, err);
+        return;
+      }
+
+      progress = payload.progress ?? progress;
+      statusText = payload.status ?? statusText;
+      _resetTimeout();
+      showSkip = false;
+
+      if (payload.progress === 100 && payload.results) {
+        results = payload.results;
+        phase = 'complete';
+        _clearTimeout();
+        _ws.close();
+      } else if (payload.status && payload.status.startsWith('FATAL ERROR')) {
+        phase = 'error';
+        _clearTimeout();
+        _ws.close();
+      }
+    };
+
+    _ws.onerror = () => {
+      statusText = 'WebSocket error — is the backend running?';
+      phase = 'error';
+      _clearTimeout();
+    };
+
+    _ws.onclose = () => {
+      if (phase === 'loading') {
+        phase = 'error';
+        statusText = 'Connection closed unexpectedly.';
+        _clearTimeout();
+      }
+    };
+  }
+
+  function skipChannel() {
+    showSkip = false;
+    _clearTimeout();
+    if (_ws) { try { _ws.close(); } catch (_) {} }
+    phase = 'error';
+    statusText = 'Channel skipped (timeout).';
+  }
+
+  function _resetTimeout() {
+    _clearTimeout();
+    _timeoutHandle = setTimeout(() => {
+      if (phase === 'loading') showSkip = true;
+    }, 60_000);
+  }
+
+  function _clearTimeout() {
+    if (_timeoutHandle) { clearTimeout(_timeoutHandle); _timeoutHandle = null; }
+  }
+
+  $: gradeIsGreen = results?.color_grade === 'green';
+  $: cardClass    = gradeIsGreen ? 'card-green' : 'card-red';
+  $: gradeAccent  = gradeIsGreen ? 'text-green-400' : 'text-red-400';
+  $: borderColor  = gradeIsGreen ? 'rgba(34,197,94,0.7)' : 'rgba(239,68,68,0.7)';
 </script>
 
-<!-- ─── Root ──────────────────────────────────────────────────────────────── -->
 <div class="min-h-screen bg-slate-900 flex flex-col items-center px-4 pb-20">
 
-  <!-- ══════════════════════════════════════════════════════════════════ HEADER -->
   <header class="w-full max-w-4xl pt-10 pb-8 flex items-center justify-between border-b border-slate-700/50">
     <div class="flex flex-col">
-      <span class="font-mono text-xs tracking-[0.3em] text-slate-500 uppercase mb-1">
-        Admin Terminal v2.0
-      </span>
+      <span class="font-mono text-xs tracking-[0.3em] text-slate-500 uppercase mb-1">Admin Terminal v2.1</span>
       <h1 class="font-sans text-2xl font-bold tracking-tight text-slate-100">
-        Kattalan
-        <span class="bg-gradient-to-r from-sky-400 to-violet-400 bg-clip-text text-transparent">
-          Quant Engine
-        </span>
+        Kattalan <span class="bg-gradient-to-r from-sky-400 to-violet-400 bg-clip-text text-transparent">Quant Engine</span>
       </h1>
     </div>
-
-    <!-- System Online indicator -->
     <div class="flex items-center gap-2.5 bg-slate-800/60 border border-slate-700/60 rounded-full px-4 py-2">
       <div class="dot-online"></div>
       <span class="font-mono text-xs text-green-400 tracking-widest uppercase">System Online</span>
     </div>
   </header>
 
-  <!-- ════════════════════════════════════════════════════════════ GRID LAYOUT -->
   <main class="w-full max-w-4xl mt-10 flex flex-col gap-6">
 
-    <!-- ─────────────────────────────────────── decorative ticker strip ──── -->
+    <!-- Ticker bar (stable — generated once on mount) -->
     <div class="scanner-line w-full border border-slate-800 rounded-lg bg-slate-800/30 px-5 py-2.5 flex gap-8 overflow-hidden">
-      {#each ['NSE', 'BSE', 'NIFTY50', 'BANKNIFTY', 'GOLD', 'SENSEX', 'USDINR'] as sym}
+      {#each tickers as t}
         <span class="font-mono text-xs text-slate-500 whitespace-nowrap">
-          {sym} <span class="text-slate-600">·</span>
-          <span class="text-green-500/70">{(Math.random() * 5 + 0.1).toFixed(2)}%</span>
+          {t.sym} <span class="text-slate-600">·</span>
+          <span class="text-green-500/70">{t.pct}%</span>
         </span>
       {/each}
     </div>
 
-    <!-- ════════════════════════════════════════════════════════ INPUT ZONE -->
+    <!-- Input -->
     <section class="bg-slate-800/50 border border-slate-700/60 rounded-2xl p-6 backdrop-blur-sm">
       <div class="mb-5">
-        <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-1">
-          &gt; CHANNEL_AUDIT_INIT
-        </p>
-        <p class="font-sans text-sm text-slate-400">
-          Enter a public Telegram channel name and select a lookback window to begin the AI evaluation.
-        </p>
+        <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-1">&gt; CHANNEL_AUDIT_INIT</p>
+        <p class="font-sans text-sm text-slate-400">Enter a Telegram channel name, @username, or -100 ID to begin AI evaluation.</p>
       </div>
-
       <div class="flex flex-col sm:flex-row gap-3">
-        <!-- Search bar -->
         <div class="relative flex-1">
           <span class="absolute left-3.5 top-1/2 -translate-y-1/2 font-mono text-slate-500 text-sm select-none">@</span>
-          <input
-            id="channel-input"
-            type="text"
-            bind:value={channelName}
-            placeholder="channel_username"
-            disabled={phase === 'loading'}
-            class="w-full bg-slate-900 border border-slate-600/70 rounded-lg pl-8 pr-4 py-3
-                   font-mono text-sm text-slate-100 placeholder-slate-600
-                   focus:outline-none focus:ring-2 focus:ring-sky-500/50 focus:border-sky-500/60
-                   disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
-          />
+          <input id="channel-input" type="text" bind:value={channelInput}
+            placeholder="Name, @username, or -100 ID" disabled={phase === 'loading'}
+            class="w-full bg-slate-900 border border-slate-600/70 rounded-lg pl-8 pr-4 py-3 font-mono text-sm text-slate-100
+                   placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500/50 focus:border-sky-500/60
+                   disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"/>
         </div>
-
-        <!-- Timeframe dropdown -->
         <div class="relative">
-          <select
-            id="timeframe-select"
-            bind:value={timeframe}
-            disabled={phase === 'loading'}
-            class="appearance-none bg-slate-900 border border-slate-600/70 rounded-lg
-                   px-4 pr-9 py-3 font-mono text-sm text-slate-300
-                   focus:outline-none focus:ring-2 focus:ring-sky-500/50 focus:border-sky-500/60
-                   disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 cursor-pointer"
-          >
+          <select id="timeframe-select" bind:value={timeframe} disabled={phase === 'loading'}
+            class="appearance-none bg-slate-900 border border-slate-600/70 rounded-lg px-4 pr-9 py-3 font-mono text-sm
+                   text-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500/50 focus:border-sky-500/60
+                   disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 cursor-pointer">
             {#each timeframeOptions as opt}
               <option value={opt.value}>{opt.label}</option>
             {/each}
           </select>
-          <!-- custom chevron -->
-          <svg class="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
+          <svg class="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none"
+               fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/>
           </svg>
         </div>
-
-        <!-- Audit button -->
-        <button
-          id="audit-btn"
-          on:click={startAudit}
-          disabled={phase === 'loading' || !channelName.trim()}
+        <button id="audit-btn" on:click={startAudit}
+          disabled={phase === 'loading' || !channelInput.trim()}
           class="relative px-6 py-3 rounded-lg font-mono text-sm font-semibold tracking-wider uppercase
-                 bg-gradient-to-r from-sky-500 to-violet-600 text-white
-                 hover:from-sky-400 hover:to-violet-500
+                 bg-gradient-to-r from-sky-500 to-violet-600 text-white hover:from-sky-400 hover:to-violet-500
                  disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed
-                 transition-all duration-300 shadow-lg hover:shadow-sky-500/30
-                 active:scale-95 whitespace-nowrap"
-        >
+                 transition-all duration-300 shadow-lg hover:shadow-sky-500/30 active:scale-95 whitespace-nowrap">
           {#if phase === 'loading'}
             <svg class="w-4 h-4 animate-spin inline-block mr-2 -mt-0.5" fill="none" viewBox="0 0 24 24">
               <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
@@ -2299,29 +2033,22 @@ FILE: .\frontend\src\routes\+page.svelte
       </div>
     </section>
 
-    <!-- ════════════════════════════════════════ LIVE LOADING STATE ══════════ -->
+    <!-- Progress / Error panel -->
     {#if phase === 'loading' || phase === 'error'}
       <section class="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-6 backdrop-blur-sm">
-        <!-- Terminal header -->
         <div class="flex items-center gap-2 mb-4">
           <div class="w-2.5 h-2.5 rounded-full bg-red-500/80"></div>
           <div class="w-2.5 h-2.5 rounded-full bg-yellow-500/80"></div>
           <div class="w-2.5 h-2.5 rounded-full bg-green-500/80"></div>
           <span class="font-mono text-xs text-slate-600 ml-2 tracking-widest">KATTALAN_ENGINE — AUDIT_LOG</span>
         </div>
-
-        <!-- Progress bar track -->
         <div class="w-full h-2 bg-slate-700/60 rounded-full overflow-hidden mb-4">
           {#if phase === 'error'}
-            <div class="h-full bg-red-500 rounded-full transition-all duration-500"
-                 style="width: {progress}%"></div>
+            <div class="h-full bg-red-500 rounded-full transition-all duration-500" style="width:{progress}%"></div>
           {:else}
-            <div class="h-full rounded-full progress-shimmer transition-all duration-500"
-                 style="width: {progress}%"></div>
+            <div class="h-full rounded-full progress-shimmer transition-all duration-500" style="width:{progress}%"></div>
           {/if}
         </div>
-
-        <!-- Progress percentage + status -->
         <div class="flex items-baseline justify-between">
           <p class="font-mono text-xs {phase === 'error' ? 'text-red-400' : 'text-sky-400'} tracking-wide">
             &gt; {statusText}
@@ -2331,13 +2058,24 @@ FILE: .\frontend\src\routes\+page.svelte
           </span>
         </div>
 
-        <!-- Animated scan lines when loading -->
+        <!-- 60s timeout skip button -->
+        {#if showSkip}
+          <div class="mt-4 flex items-center gap-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+            <span class="font-mono text-xs text-yellow-400">Progress stalled &gt; 60s</span>
+            <button on:click={skipChannel}
+              class="ml-auto font-mono text-xs px-3 py-1 rounded border border-yellow-500/50 text-yellow-400
+                     hover:bg-yellow-500/20 transition-colors">
+              Skip Channel
+            </button>
+          </div>
+        {/if}
+
         {#if phase === 'loading'}
           <div class="mt-4 space-y-1.5">
             {#each [1,2,3] as i}
               <div class="h-1 rounded bg-slate-700/40 overflow-hidden">
                 <div class="h-full w-1/3 bg-gradient-to-r from-transparent via-sky-500/20 to-transparent
-                            animate-[scan_2s_ease-in-out_{i * 0.3}s_infinite]"></div>
+                            animate-[scan_2s_ease-in-out_{i*0.3}s_infinite]"></div>
               </div>
             {/each}
           </div>
@@ -2345,78 +2083,79 @@ FILE: .\frontend\src\routes\+page.svelte
       </section>
     {/if}
 
-    <!-- ════════════════════════════════════════════ RESULTS CARD ═══════════ -->
+    <!-- Result card -->
     {#if phase === 'complete' && results}
-      <section
-        class="fade-in border rounded-2xl p-6 backdrop-blur-sm relative overflow-hidden {cardClass}"
-        style="background: linear-gradient(135deg, {gradeIsGreen ? 'rgba(34,197,94,0.06)' : 'rgba(239,68,68,0.06)'} 0%, rgba(15,23,42,0.95) 60%)"
-      >
-        <!-- Top accent bar -->
+      <section class="fade-in border rounded-2xl p-6 backdrop-blur-sm relative overflow-hidden {cardClass}"
+        style="background:linear-gradient(135deg,{gradeIsGreen?'rgba(34,197,94,0.06)':'rgba(239,68,68,0.06)'} 0%,rgba(15,23,42,0.95) 60%)">
         <div class="absolute top-0 left-0 right-0 h-px"
-             style="background: linear-gradient(90deg, transparent, {borderColor}, transparent)"></div>
+             style="background:linear-gradient(90deg,transparent,{borderColor},transparent)"></div>
 
-        <!-- Header row -->
         <div class="flex items-start justify-between mb-6">
           <div>
-            <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-1">
-              // AUDIT_RESULT — COMPLETE
-            </p>
-            <h2 class="font-mono text-xl font-bold text-slate-100">
-              @{results.channel}
-            </h2>
+            <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-1">// AUDIT_RESULT — COMPLETE</p>
+            <h2 class="font-mono text-xl font-bold text-slate-100">{results.channel_name}</h2>
+            <p class="font-mono text-xs text-slate-600 mt-0.5">{results.total_messages_scraped} messages scraped</p>
           </div>
           <div class="flex flex-col items-end gap-1">
             <span class="font-mono text-xs uppercase tracking-widest {gradeAccent}">
               {gradeIsGreen ? '▲ EDGE POSITIVE' : '▼ EDGE NEGATIVE'}
             </span>
             <div class="w-2.5 h-2.5 rounded-full {gradeIsGreen ? 'bg-green-400' : 'bg-red-400'}"
-                 style="box-shadow: 0 0 8px {gradeIsGreen ? 'rgba(34,197,94,0.9)' : 'rgba(239,68,68,0.9)'}"></div>
+                 style="box-shadow:0 0 8px {gradeIsGreen?'rgba(34,197,94,0.9)':'rgba(239,68,68,0.9)'}"></div>
           </div>
         </div>
 
-        <!-- Stats grid -->
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-
-          <!-- Trades Evaluated -->
+        <!-- Primary metrics -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
           <div class="bg-slate-900/60 border border-slate-700/50 rounded-xl p-4">
-            <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-2">
-              Trades Evaluated
-            </p>
-            <p class="font-mono text-3xl font-bold text-slate-100 tabular-nums">
-              {results.total_trades}
-            </p>
+            <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-2">Trades Decided</p>
+            <p class="font-mono text-3xl font-bold text-slate-100 tabular-nums">{results.total_trades}</p>
           </div>
-
-          <!-- Win Rate -->
           <div class="bg-slate-900/60 border border-slate-700/50 rounded-xl p-4">
-            <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-2">
-              Win Rate
-            </p>
-            <p class="font-mono text-3xl font-bold {gradeAccent} tabular-nums">
-              {results.win_rate}
-            </p>
+            <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-2">Win Rate</p>
+            <p class="font-mono text-3xl font-bold {gradeAccent} tabular-nums">{results.win_rate_pct.toFixed(1)}%</p>
           </div>
-
-          <!-- Edge Ratio -->
           <div class="bg-slate-900/60 border border-slate-700/50 rounded-xl p-4">
-            <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-2">
-              Edge Ratio
-            </p>
+            <p class="font-mono text-xs text-slate-500 uppercase tracking-widest mb-2">Edge Ratio</p>
             <p class="font-mono text-3xl font-bold {gradeAccent} tabular-nums">
-              {results.edge_ratio > 0 ? '+' : ''}{results.edge_ratio}
+              {results.edge_ratio > 0 ? '+' : ''}{results.edge_ratio.toFixed(2)}
             </p>
           </div>
         </div>
 
-        <!-- Footer note -->
-        <div class="mt-5 pt-4 border-t border-slate-700/40 flex items-center justify-between">
+        <!-- Secondary metrics -->
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+          {#each [
+            { label: 'Wins',       val: results.total_wins,       color: 'text-green-400' },
+            { label: 'Losses',     val: results.total_losses,     color: 'text-red-400' },
+            { label: 'Squared Off',val: results.total_squared_off,color: 'text-yellow-400' },
+            { label: 'Expired',    val: results.total_expired,    color: 'text-slate-400' },
+          ] as m}
+            <div class="bg-slate-900/40 border border-slate-700/40 rounded-lg p-3">
+              <p class="font-mono text-xs text-slate-600 uppercase tracking-widest mb-1">{m.label}</p>
+              <p class="font-mono text-xl font-bold {m.color} tabular-nums">{m.val}</p>
+            </div>
+          {/each}
+        </div>
+
+        <!-- MFE / MAE -->
+        <div class="grid grid-cols-2 gap-3 mb-5">
+          <div class="bg-slate-900/40 border border-slate-700/40 rounded-lg p-3">
+            <p class="font-mono text-xs text-slate-600 uppercase tracking-widest mb-1">Avg MFE (pts)</p>
+            <p class="font-mono text-lg font-bold text-green-400/80 tabular-nums">{results.avg_mfe.toFixed(2)}</p>
+          </div>
+          <div class="bg-slate-900/40 border border-slate-700/40 rounded-lg p-3">
+            <p class="font-mono text-xs text-slate-600 uppercase tracking-widest mb-1">Avg MAE (pts)</p>
+            <p class="font-mono text-lg font-bold text-red-400/80 tabular-nums">{results.avg_mae.toFixed(2)}</p>
+          </div>
+        </div>
+
+        <div class="pt-4 border-t border-slate-700/40 flex items-center justify-between">
           <span class="font-mono text-xs text-slate-600">
             Saved to Supabase · {new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
           </span>
-          <button
-            on:click={() => { phase = 'idle'; results = null; channelName = ''; }}
-            class="font-mono text-xs text-slate-500 hover:text-sky-400 transition-colors duration-200 underline underline-offset-2"
-          >
+          <button on:click={() => { phase='idle'; results=null; channelInput=''; }}
+            class="font-mono text-xs text-slate-500 hover:text-sky-400 transition-colors duration-200 underline underline-offset-2">
             &#8635; New Audit
           </button>
         </div>
@@ -2425,14 +2164,9 @@ FILE: .\frontend\src\routes\+page.svelte
 
   </main>
 
-  <!-- ═══════════════════════════════════════════════════════════════ FOOTER -->
   <footer class="w-full max-w-4xl mt-auto pt-12 border-t border-slate-800/60 flex justify-between items-center">
-    <span class="font-mono text-xs text-slate-700 tracking-widest uppercase">
-      Kattalan Engine © {new Date().getFullYear()}
-    </span>
-    <span class="font-mono text-xs text-slate-700">
-      ws://127.0.0.1:8000/api/ws/audit
-    </span>
+    <span class="font-mono text-xs text-slate-700 tracking-widest uppercase">Kattalan Engine © {new Date().getFullYear()}</span>
+    <span class="font-mono text-xs text-slate-700">ws://127.0.0.1:8000/api/ws/audit</span>
   </footer>
 
 </div>
